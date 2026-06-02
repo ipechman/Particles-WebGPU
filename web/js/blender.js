@@ -56,6 +56,16 @@ const zeroVelInstr = () => ({
   scale: [0, 0, 0], shearX: [0, 0, 0], shearY: [0, 0, 0], shearZ: [0, 0, 0], translate: [0, 0, 0],
 });
 
+// Deep copy one instruction, tolerating partial/serialized input (from storage).
+const cloneInstr = (t) => ({
+  scale: (t.scale || [1, 1, 1]).slice(0, 3),
+  shearX: (t.shearX || [0, 0, 0]).slice(0, 3),
+  shearY: (t.shearY || [0, 0, 0]).slice(0, 3),
+  shearZ: (t.shearZ || [0, 0, 0]).slice(0, 3),
+  rot: (t.rot || [0, 0, 0, 1]).slice(0, 4),
+  translate: (t.translate || [0, 0, 0]).slice(0, 3),
+});
+
 // The selectable morph functions (value -> label). The first is the default.
 export const MORPH_FUNCTIONS = [
   ["lerpSmoothing", "Lerp Smoothing"],
@@ -106,6 +116,27 @@ export class Blender {
 
   setMorphMode(mode) {
     this.morphMode = mode;
+    this._resetMorphState();
+  }
+
+  // Capture the currently displayed shape (deep copy of its transform set).
+  getCurrentShape() {
+    return this.blendedSet.map(cloneInstr);
+  }
+
+  // Load a saved shape: display it statically (as both source and target) and
+  // stop animating so it doesn't immediately morph away.
+  loadShape(transforms) {
+    if (!Array.isArray(transforms) || transforms.length === 0) return;
+    this.preset = "Procedural";
+    this.proceduralCount = transforms.length;
+    this.set1 = transforms.map(cloneInstr);
+    this.set2 = transforms.map(cloneInstr);
+    this.moveTowardSet = transforms.map(cloneInstr);
+    this.blendedSet = this.moveTowardSet;
+    this.animate = false;
+    this.t = 0;
+    this.ramp = 0;
     this._resetMorphState();
   }
 

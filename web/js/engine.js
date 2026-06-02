@@ -22,6 +22,7 @@ const SHADER_FILES = {
   render: "shaders/render.wgsl",
   post: "shaders/post.wgsl",
   present: "shaders/present.wgsl",
+  kuwahara: "shaders/kuwahara.wgsl",
 };
 
 export class Engine {
@@ -42,8 +43,13 @@ export class Engine {
     this.backgroundColor = [0.0, 0.0, 0.0];
 
     // ---- post-processing ----
+    // Anisotropic Kuwahara filter (Acerola). Painterly, flow-aligned.
     this.kuwaharaEnabled = false;
-    this.kuwaharaRadius = 4;        // window radius for the original Kuwahara filter
+    this.kuwaharaKernelSize = 16;   // window size; radius = kernelSize / 2
+    this.kuwaharaSharpness = 8.0;   // _Q
+    this.kuwaharaAlpha = 1.0;
+    this.kuwaharaZeroCrossing = 0.58;
+    this.kuwaharaBlurRadius = 2;
     this.bloomIntensity = 0.5;      // 0 disables bloom
     this.bloomThreshold = 0.3;      // low enough that bloom is visible on most fractals
     this.bloomSpread = 2.0;
@@ -177,6 +183,14 @@ export class Engine {
           { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         ],
       }),
+      // Anisotropic Kuwahara: two input textures (read via textureLoad) + params.
+      kuw: d.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        ],
+      }),
     };
 
     this.pl = {
@@ -188,6 +202,7 @@ export class Engine {
       render: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.render] }),
       post: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.post] }),
       present: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.present] }),
+      kuw: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.kuw] }),
     };
   }
 
@@ -228,9 +243,21 @@ export class Engine {
         primitive: { topology: "triangle-list" },
       });
 
-    this.pipe.kuwahara = post("fsKuwahara", SCENE_FORMAT);
     this.pipe.prefilter = post("fsPrefilter", SCENE_FORMAT);
     this.pipe.blur = post("fsBlur", SCENE_FORMAT);
+
+    // Anisotropic Kuwahara passes (own module + layout).
+    const kuw = (entry) =>
+      d.createRenderPipeline({
+        layout: this.pl.kuw,
+        vertex: { module: this.modules.kuwahara, entryPoint: "vsFull" },
+        fragment: { module: this.modules.kuwahara, entryPoint: entry, targets: [{ format: SCENE_FORMAT }] },
+        primitive: { topology: "triangle-list" },
+      });
+    this.pipe.kuwStructure = kuw("fsStructureTensor");
+    this.pipe.kuwBlurH = kuw("fsTensorBlurH");
+    this.pipe.kuwAniso = kuw("fsAnisotropy");
+    this.pipe.kuwFilter = kuw("fsKuwahara");
 
     this.pipe.present = d.createRenderPipeline({
       layout: this.pl.present,
@@ -446,16 +473,21 @@ export class Engine {
     this.depthTex = d.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT });
     this.depthView = this.depthTex.createView();
 
-    for (const t of [this.sceneTex, this.kuwaharaTex, this.bloomA, this.bloomB]) t?.destroy();
+    for (const t of [this.sceneTex, this.kuwaharaTex, this.bloomA, this.bloomB, this.tensorA, this.tensorB]) t?.destroy();
     this.sceneTex = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "sceneTex" });
     this.kuwaharaTex = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "kuwaharaTex" });
     this.bloomA = d.createTexture({ size: [hw, hh], format: SCENE_FORMAT, usage: RT, label: "bloomA" });
     this.bloomB = d.createTexture({ size: [hw, hh], format: SCENE_FORMAT, usage: RT, label: "bloomB" });
+    // Full-res scratch for the anisotropic Kuwahara structure tensor / flow map.
+    this.tensorA = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "tensorA" });
+    this.tensorB = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "tensorB" });
 
     this.sceneView = this.sceneTex.createView();
     this.kuwaharaView = this.kuwaharaTex.createView();
     this.bloomAView = this.bloomA.createView();
     this.bloomBView = this.bloomB.createView();
+    this.tensorAView = this.tensorA.createView();
+    this.tensorBView = this.tensorB.createView();
 
     const postBG = (tex, ubo) =>
       d.createBindGroup({
@@ -477,15 +509,29 @@ export class Engine {
         ],
       });
 
-    // Kuwahara reads the raw scene; bloom prefilter reads whichever image is the
-    // post-Kuwahara result; blur ping-pongs between the two half-res targets.
-    this.bgKuwahara = postBG(this.sceneView, this.uKuw);
+    // Bloom prefilter reads whichever image is the post-Kuwahara result; blur
+    // ping-pongs between the two half-res targets.
     this.bgPreFromScene = postBG(this.sceneView, this.uPre);
     this.bgPreFromKuw = postBG(this.kuwaharaView, this.uPre);
     this.bgBlurH = postBG(this.bloomAView, this.uBlurH);
     this.bgBlurV = postBG(this.bloomBView, this.uBlurV);
     this.bgPresentScene = presentBG(this.sceneView);
     this.bgPresentKuw = presentBG(this.kuwaharaView);
+
+    // Anisotropic Kuwahara passes (binding 1 is unused by the first three).
+    const kuwBG = (a, b) =>
+      d.createBindGroup({
+        layout: this.bgl.kuw,
+        entries: [
+          { binding: 0, resource: a },
+          { binding: 1, resource: b },
+          { binding: 2, resource: { buffer: this.uKuw } },
+        ],
+      });
+    this.bgKuwStructure = kuwBG(this.sceneView, this.sceneView);   // scene -> tensorA
+    this.bgKuwBlurH = kuwBG(this.tensorAView, this.tensorAView);   // tensorA -> tensorB
+    this.bgKuwAniso = kuwBG(this.tensorBView, this.tensorBView);   // tensorB -> tensorA (flow map)
+    this.bgKuwFilter = kuwBG(this.sceneView, this.tensorAView);    // scene + flow map -> kuwaharaTex
   }
 
   // ---- the per-frame pipeline --------------------------------------------
@@ -672,8 +718,12 @@ export class Engine {
     const htx = 1 / Math.max(1, this._fbW >> 1);
     const hty = 1 / Math.max(1, this._fbH >> 1);
 
+    // KuwParams = { kernelSize, q, alpha, zeroCrossing, blurRadius, ... }
+    q.writeBuffer(this.uKuw, 0, new Float32Array([
+      this.kuwaharaKernelSize, this.kuwaharaSharpness, this.kuwaharaAlpha,
+      this.kuwaharaZeroCrossing, this.kuwaharaBlurRadius, 0, 0, 0,
+    ]));
     // PostParams = { p0: vec4 (texel.xy, radius/threshold, -), p1: vec4 (dir.xy, spread, -) }
-    q.writeBuffer(this.uKuw, 0, new Float32Array([tx, ty, this.kuwaharaRadius, 0, 0, 0, 0, 0]));
     q.writeBuffer(this.uPre, 0, new Float32Array([tx, ty, this.bloomThreshold, 0, 0, 0, 0, 0]));
     q.writeBuffer(this.uBlurH, 0, new Float32Array([htx, hty, 0, 0, 1, 0, this.bloomSpread, 0]));
     q.writeBuffer(this.uBlurV, 0, new Float32Array([htx, hty, 0, 0, 0, 1, this.bloomSpread, 0]));
@@ -681,10 +731,13 @@ export class Engine {
   }
 
   _encodePost(enc) {
-    // 1) Optional Kuwahara filter (scene -> kuwaharaTex).
+    // 1) Optional anisotropic Kuwahara filter (4 passes -> kuwaharaTex).
     const useKuwahara = this.kuwaharaEnabled;
     if (useKuwahara) {
-      this._fullscreen(enc, this.pipe.kuwahara, this.bgKuwahara, this.kuwaharaView);
+      this._fullscreen(enc, this.pipe.kuwStructure, this.bgKuwStructure, this.tensorAView); // scene -> tensorA
+      this._fullscreen(enc, this.pipe.kuwBlurH, this.bgKuwBlurH, this.tensorBView);         // tensorA -> tensorB
+      this._fullscreen(enc, this.pipe.kuwAniso, this.bgKuwAniso, this.tensorAView);         // tensorB -> tensorA (flow map)
+      this._fullscreen(enc, this.pipe.kuwFilter, this.bgKuwFilter, this.kuwaharaView);      // scene + flow map -> kuwaharaTex
     }
     const bgPrefilter = useKuwahara ? this.bgPreFromKuw : this.bgPreFromScene;
     const bgPresent = useKuwahara ? this.bgPresentKuw : this.bgPresentScene;

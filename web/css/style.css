@@ -109,6 +109,19 @@ html, body {
   margin: 1px 0;
 }
 
+.row.btns { gap: 8px; }
+.row.btns button {
+  flex: 1 1 0;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px;
+  cursor: pointer;
+}
+.row.btns button:hover { background: rgba(255, 255, 255, 0.11); }
+
 select, input[type="range"], button.full {
   flex: 1 1 auto;
   min-width: 0;
