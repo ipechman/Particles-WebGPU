@@ -4,6 +4,7 @@
 import { PRESET_LABELS } from "./presets.js";
 import { MORPH_FUNCTIONS } from "./blender.js";
 import { THEMES, findTheme } from "./themes.js";
+import { getSavedShapes, addSavedShape, deleteSavedShape } from "./storage.js";
 
 const hex2rgb = (h) => {
   const n = parseInt(h.slice(1), 16);
@@ -98,6 +99,21 @@ export function buildUI(engine, blender, camera) {
   padVal.textContent = engine.scalePadding.toFixed(2);
 
   $("kuwahara").checked = engine.kuwaharaEnabled;
+  const kuwSize = $("kuwSize");
+  const kuwSizeVal = $("kuwSizeVal");
+  const kuwSharp = $("kuwSharp");
+  const kuwSharpVal = $("kuwSharpVal");
+  kuwSize.value = String(engine.kuwaharaKernelSize);
+  kuwSizeVal.textContent = engine.kuwaharaKernelSize;
+  kuwSharp.value = String(engine.kuwaharaSharpness);
+  kuwSharpVal.textContent = engine.kuwaharaSharpness;
+  const updateKuwRows = () => {
+    const show = $("kuwahara").checked ? "" : "none";
+    $("kuwSizeRow").style.display = show;
+    $("kuwSharpRow").style.display = show;
+  };
+  updateKuwRows();
+
   const bloom = $("bloom");
   const bloomVal = $("bloomVal");
   bloom.value = String(engine.bloomIntensity);
@@ -107,6 +123,53 @@ export function buildUI(engine, blender, camera) {
     $("countRow").style.display = blender.preset === "Procedural" ? "" : "none";
   };
   updateCountRow();
+
+  // ---- saved shapes (localStorage) ----
+  const shapeList = $("shapeList");
+  let savedShapes = getSavedShapes();
+  const refreshShapeList = (sel = -1) => {
+    shapeList.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "-1";
+    ph.textContent = savedShapes.length ? "— load saved —" : "— none saved —";
+    shapeList.appendChild(ph);
+    savedShapes.forEach((s, i) => {
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = s.name || `Shape ${i + 1}`;
+      shapeList.appendChild(o);
+    });
+    shapeList.value = String(sel);
+  };
+  refreshShapeList();
+
+  const syncAfterLoad = () => {
+    preset.value = "Procedural";
+    updateCountRow();
+    pcount.value = String(blender.proceduralCount);
+    pcountVal.textContent = blender.proceduralCount;
+    $("animate").checked = false;
+  };
+
+  shapeList.addEventListener("change", () => {
+    const idx = parseInt(shapeList.value, 10);
+    if (idx < 0 || !savedShapes[idx]) return;
+    blender.loadShape(savedShapes[idx].transforms);
+    syncAfterLoad();
+  });
+  $("saveShape").addEventListener("click", () => {
+    const def = `Shape ${savedShapes.length + 1}`;
+    const name = window.prompt("Name this shape:", def);
+    if (name === null) return; // cancelled
+    savedShapes = addSavedShape(name.trim() || def, blender.getCurrentShape());
+    refreshShapeList(savedShapes.length - 1);
+  });
+  $("deleteShape").addEventListener("click", () => {
+    const idx = parseInt(shapeList.value, 10);
+    if (idx < 0) return;
+    savedShapes = deleteSavedShape(idx);
+    refreshShapeList(-1);
+  });
 
   // ---- events ----
   preset.addEventListener("change", () => {
@@ -149,7 +212,18 @@ export function buildUI(engine, blender, camera) {
     engine.scalePadding = parseFloat(e.target.value);
     padVal.textContent = engine.scalePadding.toFixed(2);
   });
-  $("kuwahara").addEventListener("change", (e) => (engine.kuwaharaEnabled = e.target.checked));
+  $("kuwahara").addEventListener("change", (e) => {
+    engine.kuwaharaEnabled = e.target.checked;
+    updateKuwRows();
+  });
+  kuwSize.addEventListener("input", (e) => {
+    engine.kuwaharaKernelSize = parseInt(e.target.value, 10);
+    kuwSizeVal.textContent = engine.kuwaharaKernelSize;
+  });
+  kuwSharp.addEventListener("input", (e) => {
+    engine.kuwaharaSharpness = parseFloat(e.target.value);
+    kuwSharpVal.textContent = engine.kuwaharaSharpness;
+  });
   bloom.addEventListener("input", (e) => {
     engine.bloomIntensity = parseFloat(e.target.value);
     bloomVal.textContent = engine.bloomIntensity.toFixed(2);
