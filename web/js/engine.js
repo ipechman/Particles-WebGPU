@@ -30,7 +30,7 @@ export class Engine {
     this.canvas = canvas;
 
     // ---- tunable configuration (defaults mirror the original project) ----
-    this.particlesPerBatch = 1 << 20;     // 1,048,576
+    this.particlesPerBatch = 1 << 23;     // 8,388,608 (8.4M)
     this.voxelGridDim = 128;              // grid resolution
     this.voxelBounds = 3.0;               // world-space box size
     this.lowDetailGenerations = 8;
