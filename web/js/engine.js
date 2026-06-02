@@ -35,10 +35,11 @@ export class Engine {
     this.lowDetailGenerations = 8;
     this.scalePadding = 0.5;              // flagship fit padding
 
-    this.particleColor = [0.8537736, 1.0, 0.8947165];
+    this.particleColor = [0.93, 0.94, 0.96]; // neutral near-white highlight
     this.occlusionColor = [0.103773594, 0.014195448, 0.014195448];
     this.occlusionMultiplier = 1.0;
     this.occlusionAttenuation = 1.0;
+    this.backgroundColor = [0.0, 0.0, 0.0];
 
     // ---- post-processing ----
     this.kuwaharaEnabled = false;
@@ -546,13 +547,19 @@ export class Engine {
     // uReduce: inputSize = N
     q.writeBuffer(this.uReduce, 0, new Uint32Array([s.N, 0, 0, 0]));
 
-    // uFit: targetBounds, scalePadding, particleCount(=N as float)
+    // uFit: targetBounds, scalePadding, particleCount(=N as float). The fit
+    // scales the fractal to radius = voxelBounds * scalePadding.
     q.writeBuffer(this.uFit, 0, new Float32Array([this.voxelBounds, this.scalePadding, s.N, 0]));
+
+    // The voxel grid box tracks the fractal size (= its diameter) so the fixed
+    // gridSize always spans the fractal: lighting resolution stays constant as
+    // the Scale slider changes, and the fractal never clips against the box.
+    const gridBounds = 2 * this.voxelBounds * this.scalePadding;
 
     // uGrid: gridSize, transformCount, particleCount, voxelCount, gridBounds, voxWidth
     const gridU = new ArrayBuffer(32);
     new Uint32Array(gridU, 0, 4).set([dim, s.count, this.particlesPerBatch, this.voxelCount]);
-    new Float32Array(gridU, 16, 1).set([this.voxelBounds]);
+    new Float32Array(gridU, 16, 1).set([gridBounds]);
     new Uint32Array(gridU, 20, 1).set([this._dims(this.particlesPerBatch).width]);
     q.writeBuffer(this.uGrid, 0, gridU);
 
@@ -564,7 +571,7 @@ export class Engine {
     new Float32Array(rb, 64, 4).set([...this.particleColor, 1]);
     new Float32Array(rb, 80, 4).set([...this.occlusionColor, 1]);
     new Uint32Array(rb, 96, 2).set([dim, s.count]);
-    new Float32Array(rb, 104, 3).set([this.voxelBounds, this.occlusionMultiplier, this.occlusionAttenuation]);
+    new Float32Array(rb, 104, 3).set([gridBounds, this.occlusionMultiplier, this.occlusionAttenuation]);
     q.writeBuffer(this.uRender, 0, rb);
   }
 
@@ -630,8 +637,9 @@ export class Engine {
   }
 
   _encodeRender(enc, transformCount) {
+    const bg = this.backgroundColor;
     const p = enc.beginRenderPass({
-      colorAttachments: [{ view: this.sceneView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
+      colorAttachments: [{ view: this.sceneView, clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 }, loadOp: "clear", storeOp: "store" }],
       depthStencilAttachment: {
         view: this.depthView,
         depthClearValue: 1.0,

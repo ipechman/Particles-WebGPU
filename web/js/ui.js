@@ -64,6 +64,7 @@ export function buildUI(engine, blender, camera) {
   speedVal.textContent = blender.speed.toFixed(1);
   $("pColor").value = rgb2hex(engine.particleColor);
   $("oColor").value = rgb2hex(engine.occlusionColor);
+  $("bgColor").value = rgb2hex(engine.backgroundColor);
   $("occMul").value = String(engine.occlusionMultiplier);
   $("occAtt").value = String(engine.occlusionAttenuation);
   const padVal = $("padVal");
@@ -103,6 +104,7 @@ export function buildUI(engine, blender, camera) {
   });
   $("pColor").addEventListener("input", (e) => (engine.particleColor = hex2rgb(e.target.value)));
   $("oColor").addEventListener("input", (e) => (engine.occlusionColor = hex2rgb(e.target.value)));
+  $("bgColor").addEventListener("input", (e) => (engine.backgroundColor = hex2rgb(e.target.value)));
   $("occMul").addEventListener("input", (e) => (engine.occlusionMultiplier = parseFloat(e.target.value)));
   $("occAtt").addEventListener("input", (e) => (engine.occlusionAttenuation = parseFloat(e.target.value)));
   $("pad").addEventListener("input", (e) => {

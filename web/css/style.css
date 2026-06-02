@@ -82,16 +82,17 @@ html, body {
   gap: 10px;
 }
 .row > span:first-child {
-  flex: 0 0 74px;
+  flex: 0 0 84px;
   color: var(--muted);
+  white-space: nowrap;
 }
 .row.check { gap: 8px; }
 .row.check span { color: var(--text); }
-.row.colors { gap: 16px; }
+.row.colors { gap: 8px; justify-content: space-between; }
 .row.colors label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 .row.colors span { color: var(--muted); }
 .val {

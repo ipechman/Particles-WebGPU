@@ -136,20 +136,23 @@ export class Blender {
     this._resetMorphState();
   }
 
-  // MoveTowardInstructions: frame-rate independent exponential decay
-  // ("lerp smoothing"), optionally modulated by the ramp animation curve.
+  // Lerp smoothing, fixed. The forked code multiplied the lerp factor by dt
+  // directly (lerp(a, b, rate*dt)), which is the frame-rate-DEPENDENT bug from
+  // Freya Holmer's "Lerp smoothing is broken". The correct exponential decay
+  // moves a fraction 1 - e^(-rate*dt) of the remaining distance each frame,
+  // which is independent of frame rate. The ramp curve modulates the rate.
   _moveTowardInstr(cur, target, dt) {
-    let decay = this.speed * dt; // frameRateIndependent = true
-    if (this.useRamp) decay *= this.curve.evaluate(this.ramp);
-    decay = Math.min(decay, 1.0);
+    let rate = this.speed;
+    if (this.useRamp) rate *= this.curve.evaluate(this.ramp);
+    const f = 1 - Math.exp(-Math.max(0, rate) * dt);
 
     return {
-      scale: v3.lerpUnclamped(cur.scale, target.scale, decay),
-      shearX: v3.lerpUnclamped(cur.shearX, target.shearX, decay),
-      shearY: v3.lerpUnclamped(cur.shearY, target.shearY, decay),
-      shearZ: v3.lerpUnclamped(cur.shearZ, target.shearZ, decay),
-      translate: v3.lerpUnclamped(cur.translate, target.translate, decay),
-      rot: quat.slerp(cur.rot, target.rot, Math.min(decay, 1.0)),
+      scale: v3.lerpUnclamped(cur.scale, target.scale, f),
+      shearX: v3.lerpUnclamped(cur.shearX, target.shearX, f),
+      shearY: v3.lerpUnclamped(cur.shearY, target.shearY, f),
+      shearZ: v3.lerpUnclamped(cur.shearZ, target.shearZ, f),
+      translate: v3.lerpUnclamped(cur.translate, target.translate, f),
+      rot: quat.slerp(cur.rot, target.rot, f),
     };
   }
 
