@@ -12,11 +12,11 @@ export class OrbitCamera {
     this.yaw = 0.6;     // radians
     this.pitch = 0.45;  // radians
     this.fov = (60 * Math.PI) / 180;
-    this.near = 0.01;
-    this.far = 1000;
 
-    this.minDistance = 0.25;
-    this.maxDistance = 40;
+    // Allow zooming in extremely close — far enough that float32 precision in
+    // the point positions themselves becomes visible.
+    this.minDistance = 0.00001;
+    this.maxDistance = 60;
 
     this._attach();
   }
@@ -29,8 +29,13 @@ export class OrbitCamera {
   }
 
   viewProj(aspect) {
+    // Near/far track the orbit distance so depth precision is consistent at any
+    // zoom level and you can keep zooming in without the near plane clipping
+    // everything away.
+    const near = Math.max(this.distance * 0.004, 1e-7);
+    const far = this.distance * 60 + 50;
     const view = mat4.lookAt(this.eye(), this.target, [0, 1, 0]);
-    const proj = mat4.perspective(this.fov, aspect, this.near, this.far);
+    const proj = mat4.perspective(this.fov, aspect, near, far);
     return mat4.multiply(proj, view);
   }
 
@@ -75,7 +80,7 @@ export class OrbitCamera {
     };
     const onWheel = (e) => {
       e.preventDefault();
-      const factor = Math.exp(e.deltaY * 0.001);
+      const factor = Math.exp(e.deltaY * 0.0015);
       this.distance = Math.max(this.minDistance, Math.min(this.maxDistance, this.distance * factor));
     };
 
