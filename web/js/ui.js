@@ -3,6 +3,7 @@
 
 import { PRESET_LABELS } from "./presets.js";
 import { MORPH_FUNCTIONS } from "./blender.js";
+import { THEMES, findTheme } from "./themes.js";
 
 const hex2rgb = (h) => {
   const n = parseInt(h.slice(1), 16);
@@ -65,6 +66,31 @@ export function buildUI(engine, blender, camera) {
   $("pColor").value = rgb2hex(engine.particleColor);
   $("oColor").value = rgb2hex(engine.occlusionColor);
   $("bgColor").value = rgb2hex(engine.backgroundColor);
+
+  // Color theme dropdown (+ a "Custom" entry shown when the user edits a swatch).
+  const theme = $("theme");
+  for (const t of THEMES) {
+    const o = document.createElement("option");
+    o.value = t.id;
+    o.textContent = t.label;
+    theme.appendChild(o);
+  }
+  const customOpt = document.createElement("option");
+  customOpt.value = "custom";
+  customOpt.textContent = "Custom";
+  theme.appendChild(customOpt);
+  theme.value = "ivory"; // matches the engine defaults
+
+  const applyTheme = (id) => {
+    const t = findTheme(id);
+    if (!t) return;
+    engine.particleColor = t.particle.slice();
+    engine.occlusionColor = t.shadow.slice();
+    engine.backgroundColor = t.bg.slice();
+    $("pColor").value = rgb2hex(t.particle);
+    $("oColor").value = rgb2hex(t.shadow);
+    $("bgColor").value = rgb2hex(t.bg);
+  };
   $("occMul").value = String(engine.occlusionMultiplier);
   $("occAtt").value = String(engine.occlusionAttenuation);
   const padVal = $("padVal");
@@ -102,9 +128,21 @@ export function buildUI(engine, blender, camera) {
     blender.speed = parseFloat(e.target.value);
     speedVal.textContent = blender.speed.toFixed(1);
   });
-  $("pColor").addEventListener("input", (e) => (engine.particleColor = hex2rgb(e.target.value)));
-  $("oColor").addEventListener("input", (e) => (engine.occlusionColor = hex2rgb(e.target.value)));
-  $("bgColor").addEventListener("input", (e) => (engine.backgroundColor = hex2rgb(e.target.value)));
+  theme.addEventListener("change", (e) => {
+    if (e.target.value !== "custom") applyTheme(e.target.value);
+  });
+  $("pColor").addEventListener("input", (e) => {
+    engine.particleColor = hex2rgb(e.target.value);
+    theme.value = "custom";
+  });
+  $("oColor").addEventListener("input", (e) => {
+    engine.occlusionColor = hex2rgb(e.target.value);
+    theme.value = "custom";
+  });
+  $("bgColor").addEventListener("input", (e) => {
+    engine.backgroundColor = hex2rgb(e.target.value);
+    theme.value = "custom";
+  });
   $("occMul").addEventListener("input", (e) => (engine.occlusionMultiplier = parseFloat(e.target.value)));
   $("occAtt").addEventListener("input", (e) => (engine.occlusionAttenuation = parseFloat(e.target.value)));
   $("pad").addEventListener("input", (e) => {

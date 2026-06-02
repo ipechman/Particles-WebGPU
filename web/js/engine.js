@@ -44,8 +44,8 @@ export class Engine {
     // ---- post-processing ----
     this.kuwaharaEnabled = false;
     this.kuwaharaRadius = 4;        // window radius for the original Kuwahara filter
-    this.bloomIntensity = 0.4;      // 0 disables bloom
-    this.bloomThreshold = 0.5;
+    this.bloomIntensity = 0.5;      // 0 disables bloom
+    this.bloomThreshold = 0.3;      // low enough that bloom is visible on most fractals
     this.bloomSpread = 2.0;
     this.bloomIterations = 3;       // blur passes -> width/softness of the glow
 
