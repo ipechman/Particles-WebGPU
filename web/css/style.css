@@ -1,0 +1,211 @@
+:root {
+  --bg: #08080a;
+  --panel: rgba(18, 18, 22, 0.82);
+  --line: rgba(255, 255, 255, 0.08);
+  --text: #e8e8ec;
+  --muted: #8a8a92;
+  --accent: #7fd8c4;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+#gpu {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+/* ---- control panel ---- */
+#ui {
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  width: 248px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  user-select: none;
+  z-index: 10;
+}
+
+#ui header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 14px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  border-bottom: 1px solid var(--line);
+}
+
+#ui header button {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1;
+}
+
+#ui .body {
+  padding: 10px 14px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+#ui.collapsed .body,
+#ui.collapsed footer { display: none; }
+
+#ui.hidden, #hint.hidden { display: none; }
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.row > span:first-child {
+  flex: 0 0 74px;
+  color: var(--muted);
+}
+.row.check { gap: 8px; }
+.row.check span { color: var(--text); }
+.row.colors { gap: 16px; }
+.row.colors label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.row.colors span { color: var(--muted); }
+.val {
+  flex: 0 0 auto;
+  width: 26px;
+  text-align: right;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.sep {
+  height: 1px;
+  background: var(--line);
+  margin: 1px 0;
+}
+
+select, input[type="range"], button.full {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+select {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 8px;
+}
+
+button.full {
+  background: rgba(127, 216, 196, 0.14);
+  color: var(--accent);
+  border: 1px solid rgba(127, 216, 196, 0.3);
+  border-radius: 7px;
+  padding: 7px;
+  cursor: pointer;
+  font-weight: 600;
+}
+button.full:hover { background: rgba(127, 216, 196, 0.22); }
+
+input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; }
+input[type="color"] {
+  width: 30px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+}
+
+input[type="range"] {
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+
+#ui footer {
+  padding: 8px 14px 10px;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+
+#hint {
+  position: fixed;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.3px;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 6px 12px;
+  border-radius: 20px;
+  z-index: 10;
+  white-space: nowrap;
+}
+
+#error {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  z-index: 20;
+  text-align: center;
+  padding: 24px;
+}
+#error.hidden { display: none; }
+#error h1 { color: #ff6b6b; font-size: 20px; margin: 0 0 8px; }
+#error p { color: var(--text); margin: 0 0 12px; max-width: 480px; }
+#error small { color: var(--muted); }
+
+@media (max-width: 520px) {
+  #hint { font-size: 10px; padding: 5px 9px; }
+  #ui { width: calc(100vw - 28px); }
+}
