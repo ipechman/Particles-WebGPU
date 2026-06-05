@@ -57,6 +57,14 @@ export class Engine {
 
     // sizes currently realized in GPU buffers (for change detection)
     this._sizes = { particles: -1, lod: -1, voxels: -1 };
+
+    // Cache for skipping the attractor/voxel/occlusion recompute when the
+    // transforms (and the params they depend on) haven't changed since the last
+    // computed frame. The render + post passes still run every frame.
+    this._computeDirty = true;
+    this._cachedTransformData = null;
+    this._cachedTransformCount = -1;
+    this._cachedScalePadding = -1;
   }
 
   get voxelCount() {
@@ -321,6 +329,9 @@ export class Engine {
     const d = this.device;
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
 
+    // New (empty) position/voxel buffers -> force a recompute next frame.
+    this._computeDirty = true;
+
     this.lodCount = MAX_LOD; // upper bound; recomputed per preset in _schedule
 
     // Positions buffer.
@@ -542,21 +553,56 @@ export class Engine {
     const transformCount = blender.getTransformCount();
     if (transformCount < 1) return;
 
-    // Upload the freshly blended affine matrices.
+    // Pack the blended affine matrices and decide whether the attractor / voxel
+    // / occlusion / fit results would actually differ from last frame.
     blender.packMatrices(this.transformData);
-    this.device.queue.writeBuffer(this.transformsBuf, 0, this.transformData);
+    const recompute = this._computeStale(transformCount);
 
     const s = this._schedule(transformCount);
     this._writeUniforms(s, camera);
     this._writePostUniforms();
 
     const enc = this.device.createCommandEncoder();
-    this._encodePredict(enc, s);
-    this._encodeIterate(enc, s);
-    this._encodeVoxelize(enc);
+    if (recompute) {
+      // The attractor, voxel grid, occlusion and fit transform all depend only
+      // on the transforms + scale, so they're rebuilt only when those change.
+      // Otherwise the existing buffer contents are reused unchanged.
+      this.device.queue.writeBuffer(this.transformsBuf, 0, this.transformData);
+      this._encodePredict(enc, s);
+      this._encodeIterate(enc, s);
+      this._encodeVoxelize(enc);
+    }
     this._encodeRender(enc, transformCount);
     this._encodePost(enc);
     this.device.queue.submit([enc.finish()]);
+  }
+
+  // True when the compute results would differ from the last computed frame.
+  // Records the new state when stale so subsequent identical frames are skipped.
+  _computeStale(transformCount) {
+    const len = transformCount * 16;
+    let stale =
+      this._computeDirty ||
+      !this._cachedTransformData ||
+      transformCount !== this._cachedTransformCount ||
+      this.scalePadding !== this._cachedScalePadding;
+
+    if (!stale) {
+      const a = this.transformData;
+      const b = this._cachedTransformData;
+      for (let i = 0; i < len; i++) {
+        if (a[i] !== b[i]) { stale = true; break; }
+      }
+    }
+
+    if (stale) {
+      if (!this._cachedTransformData) this._cachedTransformData = new Float32Array(this.transformData.length);
+      this._cachedTransformData.set(this.transformData);
+      this._cachedTransformCount = transformCount;
+      this._cachedScalePadding = this.scalePadding;
+      this._computeDirty = false;
+    }
+    return stale;
   }
 
   _writeUniforms(s, camera) {
