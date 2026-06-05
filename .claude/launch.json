@@ -4,8 +4,8 @@
     {
       "name": "fractals",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "8204", "--directory", "web"],
-      "port": 8204
+      "runtimeArgs": ["-m", "http.server", "8207", "--directory", "web"],
+      "port": 8207
     }
   ]
 }
