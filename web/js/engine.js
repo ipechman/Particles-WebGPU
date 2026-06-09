@@ -61,8 +61,19 @@ export class Engine {
     // Cache for skipping the attractor/voxel/occlusion recompute when the
     // transforms (and the params they depend on) haven't changed since the last
     // computed frame. The render + post passes still run every frame.
-    this._computeDirty = true;
-    this._batchSeed = 0; // chaos-game batch (used by static-frame accumulation)
+    // Progressive accumulation: while the shape, camera and render params are
+    // all unchanged, up to accumBatches independent chaos batches are baked
+    // into the persistent scene texture (one per frame), multiplying effective
+    // detail. Once done, the points pass is skipped entirely until something
+    // changes, so a fully idle frame costs only the post chain.
+    this.accumBatches = 8;
+    this._accumCount = 0;     // batches currently baked into the scene texture
+    this._batchSeed = 0;      // chaos batch the positions buffer holds
+    this._cachedRenderU = null; // last drawn uRender bytes (camera, colors, ...)
+    this._cachedBg = [NaN, NaN, NaN];
+    this._cachedFbW = -1;
+    this._cachedFbH = -1;
+
     this._cachedTransformData = null;
     this._cachedTransformCount = -1;
     this._cachedScalePadding = -1;
@@ -553,11 +564,32 @@ export class Engine {
     const recompute = this._computeStale(transformCount);
 
     const s = this._schedule(transformCount);
-    this._writeUniforms(s, camera);
+
+    // Classify the frame. The render-state check must run every frame so its
+    // cache tracks what is actually on screen.
+    const rb = this._buildRenderUniform(s, camera);
+    const renderStale = this._renderStale(rb);
+    let mode;
+    if (recompute) {
+      mode = "compute"; // rebuild attractor + grids, draw from scratch
+      this._batchSeed = 0;
+      this._accumCount = 1;
+    } else if (renderStale) {
+      mode = "redraw"; // same cloud, new camera/colors: draw from scratch
+      this._accumCount = 1;
+    } else if (this._accumCount < this.accumBatches) {
+      mode = "accumulate"; // bake one more independent batch into the scene
+      this._batchSeed = this._accumCount;
+      this._accumCount++;
+    } else {
+      mode = "idle"; // scene texture is final: post/present only
+    }
+
+    this._writeUniforms(s, rb);
     this._writePostUniforms();
 
     const enc = this.device.createCommandEncoder();
-    if (recompute) {
+    if (mode === "compute") {
       // The attractor, voxel grid, occlusion and fit transform all depend only
       // on the transforms + scale, so they're rebuilt only when those change.
       // Otherwise the existing buffer contents are reused unchanged.
@@ -565,8 +597,15 @@ export class Engine {
       this._encodePredict(enc, s);
       this._encodeIterate(enc);
       this._encodeVoxelize(enc);
+      this._encodeRender(enc, transformCount, true);
+    } else if (mode === "redraw") {
+      // The positions buffer holds whichever batch was baked last, so the
+      // next accumulation run may re-draw one batch. Harmless: same points.
+      this._encodeRender(enc, transformCount, true);
+    } else if (mode === "accumulate") {
+      this._encodeIterate(enc);
+      this._encodeRender(enc, transformCount, false);
     }
-    this._encodeRender(enc, transformCount);
     this._encodePost(enc);
     this.device.queue.submit([enc.finish()]);
   }
@@ -599,7 +638,53 @@ export class Engine {
     return stale;
   }
 
-  _writeUniforms(s, camera) {
+  // Build the uRender CPU bytes (viewProj, colors, grid/AO params) for this
+  // frame. Kept separate from the upload so frame() can byte-compare it
+  // against what is currently drawn into the scene texture.
+  _buildRenderUniform(s, camera) {
+    const dim = this.voxelGridDim;
+    const gridBounds = 2 * this.voxelBounds * this.scalePadding;
+    const aspect = this.canvas.width / Math.max(1, this.canvas.height);
+    const vp = camera.viewProj(aspect);
+    const rb = new ArrayBuffer(128);
+    new Float32Array(rb, 0, 16).set(vp);
+    new Float32Array(rb, 64, 4).set([...this.particleColor, 1]);
+    new Float32Array(rb, 80, 4).set([...this.occlusionColor, 1]);
+    new Uint32Array(rb, 96, 2).set([dim, s.count]);
+    new Float32Array(rb, 104, 3).set([gridBounds, this.occlusionMultiplier, this.occlusionAttenuation]);
+    return rb;
+  }
+
+  // True when the visible render state (uRender bytes, background color or
+  // framebuffer size) differs from what the scene texture currently shows.
+  // Records the new state so accumulation can resume next frame.
+  _renderStale(rb) {
+    const a = new Uint32Array(rb);
+    const b = this._cachedRenderU;
+    const bg = this.backgroundColor;
+    let stale =
+      !b ||
+      this._cachedFbW !== this._fbW ||
+      this._cachedFbH !== this._fbH ||
+      this._cachedBg[0] !== bg[0] ||
+      this._cachedBg[1] !== bg[1] ||
+      this._cachedBg[2] !== bg[2];
+    if (!stale) {
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) { stale = true; break; }
+      }
+    }
+    if (stale) {
+      if (!this._cachedRenderU) this._cachedRenderU = new Uint32Array(a.length);
+      this._cachedRenderU.set(a);
+      this._cachedBg = [bg[0], bg[1], bg[2]];
+      this._cachedFbW = this._fbW;
+      this._cachedFbH = this._fbH;
+    }
+    return stale;
+  }
+
+  _writeUniforms(s, rb) {
     const q = this.device.queue;
     const dim = this.voxelGridDim;
 
@@ -645,15 +730,7 @@ export class Engine {
     new Uint32Array(gridU, 20, 1).set([this._dims(this.particlesPerBatch).width]);
     q.writeBuffer(this.uGrid, 0, gridU);
 
-    // uRender
-    const aspect = this.canvas.width / Math.max(1, this.canvas.height);
-    const vp = camera.viewProj(aspect);
-    const rb = new ArrayBuffer(128);
-    new Float32Array(rb, 0, 16).set(vp);
-    new Float32Array(rb, 64, 4).set([...this.particleColor, 1]);
-    new Float32Array(rb, 80, 4).set([...this.occlusionColor, 1]);
-    new Uint32Array(rb, 96, 2).set([dim, s.count]);
-    new Float32Array(rb, 104, 3).set([gridBounds, this.occlusionMultiplier, this.occlusionAttenuation]);
+    // uRender (bytes prebuilt by _buildRenderUniform)
     q.writeBuffer(this.uRender, 0, rb);
   }
 
@@ -739,14 +816,22 @@ export class Engine {
     this._dispatch(enc, this.pipe.occlusion, this.bgGrid, vGroups);
   }
 
-  _encodeRender(enc, transformCount) {
+  // Draw the point cloud into the scene texture. With clear=false the pass
+  // loads the existing color + depth instead, so a fresh chaos batch adds to
+  // what previous batches already drew (progressive accumulation).
+  _encodeRender(enc, transformCount, clear) {
     const bg = this.backgroundColor;
     const p = enc.beginRenderPass({
-      colorAttachments: [{ view: this.sceneView, clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 }, loadOp: "clear", storeOp: "store" }],
+      colorAttachments: [{
+        view: this.sceneView,
+        clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 },
+        loadOp: clear ? "clear" : "load",
+        storeOp: "store",
+      }],
       depthStencilAttachment: {
         view: this.depthView,
         depthClearValue: 1.0,
-        depthLoadOp: "clear",
+        depthLoadOp: clear ? "clear" : "load",
         depthStoreOp: "store",
       },
     });

@@ -251,7 +251,9 @@ export function buildUI(engine, blender, camera) {
   const fpsEl = $("fps");
   return {
     setFps(fps) {
-      fpsEl.textContent = `${fps.toFixed(0)} fps · ${(engine.particlesPerBatch * blender.getTransformCount()).toLocaleString()} pts`;
+      // Accumulated batches multiply the points actually baked into the frame.
+      const pts = engine.particlesPerBatch * blender.getTransformCount() * Math.max(1, engine._accumCount);
+      fpsEl.textContent = `${fps.toFixed(0)} fps · ${pts.toLocaleString()} pts`;
     },
   };
 }
