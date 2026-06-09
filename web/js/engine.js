@@ -19,6 +19,7 @@ const SHADER_FILES = {
   reduce: "shaders/reduce.wgsl",
   fit: "shaders/fit.wgsl",
   voxelize: "shaders/voxelize.wgsl",
+  redistribute: "shaders/redistribute.wgsl",
   render: "shaders/render.wgsl",
   post: "shaders/post.wgsl",
   present: "shaders/present.wgsl",
@@ -35,6 +36,7 @@ export class Engine {
     this.voxelBounds = 3.0;               // world-space box size
     this.lowDetailGenerations = 8;
     this.scalePadding = 0.5;              // flagship fit padding
+    this.surfaceBias = 0.0;               // 0 = off; >0 re-seats buried particles toward the surface
 
     this.particleColor = [0.93, 0.94, 0.96]; // neutral near-white highlight
     this.occlusionColor = [0.103773594, 0.014195448, 0.014195448];
@@ -65,6 +67,7 @@ export class Engine {
     this._cachedTransformData = null;
     this._cachedTransformCount = -1;
     this._cachedScalePadding = -1;
+    this._cachedSurfaceBias = -1;
   }
 
   get voxelCount() {
@@ -165,6 +168,15 @@ export class Engine {
           buf(5, C, "uniform"),
         ],
       }),
+      redist: d.createBindGroupLayout({
+        entries: [
+          buf(0, C, "storage"),
+          buf(1, C, "read-only-storage"),
+          buf(2, C, "read-only-storage"),
+          buf(3, C, "read-only-storage"),
+          buf(4, C, "uniform"),
+        ],
+      }),
       render: d.createBindGroupLayout({
         entries: [
           buf(0, VF, "read-only-storage"),
@@ -207,6 +219,7 @@ export class Engine {
       reduce: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.reduce] }),
       fit: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.fit] }),
       grid: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.grid] }),
+      redist: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.redist] }),
       render: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.render] }),
       post: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.post] }),
       present: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.present] }),
@@ -228,6 +241,7 @@ export class Engine {
       clearGrids: comp("voxelize", "clearGrids", this.pl.grid),
       voxelize: comp("voxelize", "voxelize", this.pl.grid),
       occlusion: comp("voxelize", "occlusion", this.pl.grid),
+      redistribute: comp("redistribute", "redistribute", this.pl.redist),
     };
 
     this.pipe.render = d.createRenderPipeline({
@@ -295,6 +309,7 @@ export class Engine {
     this.uReduce = d.createBuffer({ size: 16, usage: U, label: "uReduce" });
     this.uFit = d.createBuffer({ size: 16, usage: U, label: "uFit" });
     this.uGrid = d.createBuffer({ size: 32, usage: U, label: "uGrid" });
+    this.uRedist = d.createBuffer({ size: 32, usage: U, label: "uRedist" });
     this.uRender = d.createBuffer({ size: 128, usage: U, label: "uRender" });
 
     // Post-processing uniforms (PostParams / PresentParams are 32 bytes each).
@@ -399,6 +414,17 @@ export class Engine {
         { binding: 3, resource: { buffer: this.voxelGrid } },
         { binding: 4, resource: { buffer: this.occlusionGrid } },
         { binding: 5, resource: { buffer: this.uGrid } },
+      ],
+    });
+
+    this.bgRedist = d.createBindGroup({
+      layout: this.bgl.redist,
+      entries: [
+        { binding: 0, resource: { buffer: this.positionsBuf } },
+        { binding: 1, resource: { buffer: this.transformsBuf } },
+        { binding: 2, resource: { buffer: this.finalTransformBuf } },
+        { binding: 3, resource: { buffer: this.occlusionGrid } },
+        { binding: 4, resource: { buffer: this.uRedist } },
       ],
     });
 
@@ -565,7 +591,8 @@ export class Engine {
     const enc = this.device.createCommandEncoder();
     if (recompute) {
       // The attractor, voxel grid, occlusion and fit transform all depend only
-      // on the transforms + scale, so they're rebuilt only when those change.
+      // on the transforms + scale + surface bias, so they're rebuilt only when
+      // those change.
       // Otherwise the existing buffer contents are reused unchanged.
       this.device.queue.writeBuffer(this.transformsBuf, 0, this.transformData);
       this._encodePredict(enc, s);
@@ -585,7 +612,8 @@ export class Engine {
       this._computeDirty ||
       !this._cachedTransformData ||
       transformCount !== this._cachedTransformCount ||
-      this.scalePadding !== this._cachedScalePadding;
+      this.scalePadding !== this._cachedScalePadding ||
+      this.surfaceBias !== this._cachedSurfaceBias;
 
     if (!stale) {
       const a = this.transformData;
@@ -600,6 +628,7 @@ export class Engine {
       this._cachedTransformData.set(this.transformData);
       this._cachedTransformCount = transformCount;
       this._cachedScalePadding = this.scalePadding;
+      this._cachedSurfaceBias = this.surfaceBias;
       this._computeDirty = false;
     }
     return stale;
@@ -654,6 +683,14 @@ export class Engine {
     new Float32Array(gridU, 16, 1).set([gridBounds]);
     new Uint32Array(gridU, 20, 1).set([this._dims(this.particlesPerBatch).width]);
     q.writeBuffer(this.uGrid, 0, gridU);
+
+    // uRedist: gridSize, transformCount, particleCount, width, gridBounds, bias
+    const redistU = new ArrayBuffer(32);
+    new Uint32Array(redistU, 0, 4).set([
+      dim, s.count, this.particlesPerBatch, this._dims(this.particlesPerBatch).width,
+    ]);
+    new Float32Array(redistU, 16, 2).set([gridBounds, this.surfaceBias]);
+    q.writeBuffer(this.uRedist, 0, redistU);
 
     // uRender
     const aspect = this.canvas.width / Math.max(1, this.canvas.height);
@@ -726,6 +763,13 @@ export class Engine {
     this._dispatch(enc, this.pipe.clearGrids, this.bgGrid, vGroups);
     this._dispatch(enc, this.pipe.voxelize, this.bgGrid, [vd.x, vd.y]);
     this._dispatch(enc, this.pipe.occlusion, this.bgGrid, vGroups);
+
+    // Surface bias: re-seat buried particles toward open voxels. Runs after
+    // occlusion so it can read the openness field, and the grids are NOT
+    // rebuilt afterwards: shading keeps the AO of the true (unbiased) shape.
+    if (this.surfaceBias > 0.0001) {
+      this._dispatch(enc, this.pipe.redistribute, this.bgRedist, [vd.x, vd.y]);
+    }
   }
 
   _encodeRender(enc, transformCount) {
