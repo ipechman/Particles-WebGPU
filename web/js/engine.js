@@ -62,6 +62,7 @@ export class Engine {
     // transforms (and the params they depend on) haven't changed since the last
     // computed frame. The render + post passes still run every frame.
     this._computeDirty = true;
+    this._batchSeed = 0; // chaos-game batch (used by static-frame accumulation)
     this._cachedTransformData = null;
     this._cachedTransformCount = -1;
     this._cachedScalePadding = -1;
@@ -112,7 +113,7 @@ export class Engine {
   async _loadShaders() {
     const entries = await Promise.all(
       Object.entries(SHADER_FILES).map(async ([k, path]) => {
-        const res = await fetch(path);
+        const res = await fetch(path, { cache: "no-cache" });
         if (!res.ok) throw new Error(`Failed to load shader ${path}: ${res.status}`);
         return [k, await res.text()];
       })
@@ -138,7 +139,7 @@ export class Engine {
         entries: [
           buf(0, C, "storage"),
           buf(1, C, "read-only-storage"),
-          buf(2, C, "uniform", true),
+          buf(2, C, "uniform"),
         ],
       }),
       lod: d.createBindGroupLayout({
@@ -285,10 +286,12 @@ export class Engine {
     this.finalTransformBuf = d.createBuffer({ size: 64, usage: S, label: "finalTransform" });
     this.reduceResultBuf = d.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE, label: "reduceResult" });
 
-    // Dynamic-offset uniform rings.
-    this.uIter = d.createBuffer({ size: SLOT * MAX_SLOTS, usage: U, label: "uIter" });
+    // Chaos-game uniform: 32-byte header + per-transform fixed-point seeds.
+    this.uChaos = d.createBuffer({ size: 32 + MAX_TRANSFORMS * 16, usage: U, label: "uChaos" });
+    this.uChaosCPU = new ArrayBuffer(32 + MAX_TRANSFORMS * 16);
+
+    // Dynamic-offset uniform ring (LOD bounds-prediction chain).
     this.uLod = d.createBuffer({ size: SLOT * MAX_SLOTS, usage: U, label: "uLod" });
-    this.uIterCPU = new Uint32Array((SLOT * MAX_SLOTS) / 4);
     this.uLodCPU = new Uint32Array((SLOT * MAX_SLOTS) / 4);
 
     // Small single-use uniforms.
@@ -357,7 +360,7 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.positionsBuf } },
         { binding: 1, resource: { buffer: this.transformsBuf } },
-        { binding: 2, resource: { buffer: this.uIter, size: SLOT } },
+        { binding: 2, resource: { buffer: this.uChaos } },
       ],
     });
 
@@ -428,23 +431,17 @@ export class Engine {
     }
   }
 
-  // Compute the iteration / LOD schedule for the current transform count.
+  // Compute the chaos-game / LOD schedule for the current transform count.
   _schedule(transformCount) {
     const count = Math.max(transformCount, 1);
 
-    // Iterated-system generations tile [0, particlesPerBatch) contiguously.
-    const gens = [];
-    let iterated = count;
-    let prev = count;
-    gens.push({ offset: 0, limit: count });
-    while (iterated < this.particlesPerBatch) {
-      const genSize = prev * count;
-      const limit = Math.min(iterated + genSize, this.particlesPerBatch);
-      gens.push({ offset: iterated, limit });
-      iterated += genSize;
-      prev = genSize;
-      if (gens.length >= MAX_SLOTS) break;
-    }
+    // Chaos-game hops per particle. The seeds already lie exactly on the
+    // attractor, so hops control sampling granularity, not convergence: pick
+    // enough that distinct hop sequences comfortably outnumber the particles
+    // (count^iters >= particleCount * count^8).
+    const iters = count >= 2
+      ? Math.min(40, Math.max(12, Math.ceil(Math.log(this.particlesPerBatch) / Math.log(count)) + 8))
+      : 4;
 
     // LOD generations, capped so the point count stays bounded.
     let lodGens = this.lowDetailGenerations;
@@ -457,10 +454,7 @@ export class Engine {
     const levels = lodGens - 1; // number of lodIterate dispatches
     const lodFinalIsA = levels % 2 === 0; // lodFirst writes A; each level swaps
 
-    // 2D dispatch dims for each generation (large counts exceed the 1D cap).
-    const genDims = gens.map((g) => this._dims(g.limit - g.offset));
-
-    return { count, gens, genDims, lodGens, N, levels, lodFinalIsA };
+    return { count, iters, lodGens, N, levels, lodFinalIsA };
   }
 
   resize() {
@@ -569,7 +563,7 @@ export class Engine {
       // Otherwise the existing buffer contents are reused unchanged.
       this.device.queue.writeBuffer(this.transformsBuf, 0, this.transformData);
       this._encodePredict(enc, s);
-      this._encodeIterate(enc, s);
+      this._encodeIterate(enc);
       this._encodeVoxelize(enc);
     }
     this._encodeRender(enc, transformCount);
@@ -609,16 +603,12 @@ export class Engine {
     const q = this.device.queue;
     const dim = this.voxelGridDim;
 
-    // uIter slots (one per generation): count, genOffset, genLimit, dispatchWidth.
-    this.uIterCPU.fill(0);
-    for (let g = 0; g < s.gens.length; g++) {
-      const o = (g * SLOT) / 4;
-      this.uIterCPU[o + 0] = s.count;
-      this.uIterCPU[o + 1] = s.gens[g].offset;
-      this.uIterCPU[o + 2] = s.gens[g].limit;
-      this.uIterCPU[o + 3] = s.genDims[g].width;
-    }
-    q.writeBuffer(this.uIter, 0, this.uIterCPU.buffer, 0, s.gens.length * SLOT || SLOT);
+    // uChaos: header + per-transform fixed-point seeds (exact attractor points).
+    new Uint32Array(this.uChaosCPU, 0, 5).set([
+      s.count, this.particlesPerBatch, this._dims(this.particlesPerBatch).width, s.iters, this._batchSeed | 0,
+    ]);
+    new Float32Array(this.uChaosCPU, 32).set(this._fixedPoints(s.count));
+    q.writeBuffer(this.uChaos, 0, this.uChaosCPU);
 
     // uLod slots: slot 0 = lodFirst (inCount = count); slots 1.. = levels.
     this.uLodCPU.fill(0);
@@ -711,13 +701,34 @@ export class Engine {
     this._dispatch(enc, this.pipe.fit, this.bgFit, 1);
   }
 
-  _encodeIterate(enc, s) {
-    for (let g = 0; g < s.gens.length; g++) {
-      const { offset, limit } = s.gens[g];
-      if (limit - offset <= 0) continue;
-      const d = s.genDims[g];
-      this._dispatch(enc, this.pipe.iterate, this.bgIter, [d.x, d.y], [g * SLOT]);
+  // Per-transform fixed points: solve (I - A) x = t for each affine map. The
+  // fixed point of a contractive map lies exactly on the attractor, which
+  // makes it an ideal chaos-game seed (no warm-up convergence needed). Falls
+  // back to the origin when I - A is near-singular (non-contractive map).
+  _fixedPoints(count) {
+    const out = new Float32Array(MAX_TRANSFORMS * 4);
+    const td = this.transformData;
+    const det3 = (a, b, c, d, e, f, g, h, i) =>
+      a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    for (let i = 0; i < count; i++) {
+      const o = i * 16; // column-major mat4
+      const m00 = 1 - td[o + 0], m01 = -td[o + 4], m02 = -td[o + 8];
+      const m10 = -td[o + 1], m11 = 1 - td[o + 5], m12 = -td[o + 9];
+      const m20 = -td[o + 2], m21 = -td[o + 6], m22 = 1 - td[o + 10];
+      const tx = td[o + 12], ty = td[o + 13], tz = td[o + 14];
+      const det = det3(m00, m01, m02, m10, m11, m12, m20, m21, m22);
+      if (Math.abs(det) > 1e-6) {
+        out[i * 4 + 0] = det3(tx, m01, m02, ty, m11, m12, tz, m21, m22) / det;
+        out[i * 4 + 1] = det3(m00, tx, m02, m10, ty, m12, m20, tz, m22) / det;
+        out[i * 4 + 2] = det3(m00, m01, tx, m10, m11, ty, m20, m21, tz) / det;
+      }
     }
+    return out;
+  }
+
+  _encodeIterate(enc) {
+    const d = this._dims(this.particlesPerBatch);
+    this._dispatch(enc, this.pipe.iterate, this.bgIter, [d.x, d.y]);
   }
 
   _encodeVoxelize(enc) {
