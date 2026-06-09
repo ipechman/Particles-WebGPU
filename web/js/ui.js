@@ -97,9 +97,6 @@ export function buildUI(engine, blender, camera) {
   const padVal = $("padVal");
   $("pad").value = String(engine.scalePadding);
   padVal.textContent = engine.scalePadding.toFixed(2);
-  const surfBiasVal = $("surfBiasVal");
-  $("surfBias").value = String(engine.surfaceBias);
-  surfBiasVal.textContent = engine.surfaceBias.toFixed(2);
 
   $("kuwahara").checked = engine.kuwaharaEnabled;
   const kuwSize = $("kuwSize");
@@ -214,10 +211,6 @@ export function buildUI(engine, blender, camera) {
   $("pad").addEventListener("input", (e) => {
     engine.scalePadding = parseFloat(e.target.value);
     padVal.textContent = engine.scalePadding.toFixed(2);
-  });
-  $("surfBias").addEventListener("input", (e) => {
-    engine.surfaceBias = parseFloat(e.target.value);
-    surfBiasVal.textContent = engine.surfaceBias.toFixed(2);
   });
   $("kuwahara").addEventListener("change", (e) => {
     engine.kuwaharaEnabled = e.target.checked;
