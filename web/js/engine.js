@@ -63,13 +63,20 @@ export class Engine {
     // transforms (and the params they depend on) haven't changed since the last
     // computed frame. The render + post passes still run every frame.
     // Progressive accumulation: while the shape, camera and render params are
-    // all unchanged, up to accumBatches independent chaos batches are baked
-    // into the persistent scene texture (one per frame), multiplying effective
-    // detail. Once done, the points pass is skipped entirely until something
-    // changes, so a fully idle frame costs only the post chain.
-    this.accumBatches = 8;
-    this._accumCount = 0;     // batches currently baked into the scene texture
-    this._batchSeed = 0;      // chaos batch the positions buffer holds
+    // all unchanged, independent chaos batches are baked into the hidden back
+    // scene buffer (one per frame), multiplying effective detail. The batch
+    // budget scales inversely with the particle count so the resting image
+    // always converges toward ~accumTargetPoints effective points (lower
+    // particle counts buffer longer: 8 batches at 8.4M, 256 at 262K). The
+    // front/back buffers swap at geometric checkpoints (4, 16, 64, 256
+    // batches), each presenting a complete stable set. Once the budget is
+    // reached the points pass is skipped entirely, so a fully idle frame
+    // costs only the post chain.
+    this.accumTargetPoints = 1 << 26; // ~67M effective points at rest
+    this._accumCount = 0;      // batches baked into the current cycle
+    this._accumCheckpoint = 4; // batch count at which front/back swap next
+    this._backBatches = 0;     // batches in the back buffer (0 = needs seeding)
+    this._batchSeed = 0;       // chaos batch the positions buffer holds
     this._cachedRenderU = null; // last drawn uRender bytes (camera, colors, ...)
     this._cachedBg = [NaN, NaN, NaN];
     this._cachedFbW = -1;
@@ -615,15 +622,20 @@ export class Engine {
     // cache tracks what is actually on screen.
     const rb = this._buildRenderUniform(s, camera);
     const renderStale = this._renderStale(rb);
+    const accumTarget = this._accumBatchTarget();
     let mode;
     if (recompute) {
       mode = "compute"; // rebuild attractor + grids, draw the front from scratch
       this._batchSeed = 0;
       this._accumCount = 1;
+      this._backBatches = 0;
+      this._accumCheckpoint = Math.min(4, accumTarget);
     } else if (renderStale) {
       mode = "redraw"; // same cloud, new camera/colors: draw the front from scratch
       this._accumCount = 1;
-    } else if (this._accumCount < this.accumBatches) {
+      this._backBatches = 0;
+      this._accumCheckpoint = Math.min(4, accumTarget);
+    } else if (this._accumCount < accumTarget) {
       mode = "accumulate"; // bake one more batch into the hidden back buffer
       this._batchSeed = this._accumCount;
     } else {
@@ -654,22 +666,34 @@ export class Engine {
     } else if (mode === "accumulate") {
       // Accumulation happens off-screen: the front image stays on display
       // untouched while batches bake into the back buffer, and the buffers
-      // swap only once the full set is baked. The user never sees a
-      // partially accumulated in-between state.
-      if (this._accumCount === 1) {
+      // swap only at checkpoints, each presenting a complete stable set.
+      // The user never sees a partially accumulated in-between state.
+      if (this._backBatches === 0) {
+        // Seed a fresh back segment with everything the front already shows.
         const size = [this._fbW, this._fbH, 1];
         enc.copyTextureToTexture({ texture: this.sceneTexs[front] }, { texture: this.sceneTexs[back] }, size);
         enc.copyTextureToTexture({ texture: this.depthTexs[front] }, { texture: this.depthTexs[back] }, size);
+        this._backBatches = this._accumCount;
       }
       this._encodeIterate(enc);
       this._encodeRender(enc, transformCount, false, back);
       this._accumCount++;
-      if (this._accumCount >= this.accumBatches) {
-        this._front = back; // completed: present the dense image from now on
+      this._backBatches++;
+      if (this._accumCount >= this._accumCheckpoint || this._accumCount >= accumTarget) {
+        this._front = back; // checkpoint reached: present the denser image
+        this._backBatches = 0;
+        this._accumCheckpoint = Math.min(this._accumCheckpoint * 4, accumTarget);
       }
     }
     this._encodePost(enc);
     this.device.queue.submit([enc.finish()]);
+  }
+
+  // Accumulation batch budget for the current particle count: enough batches
+  // that the resting image converges toward ~accumTargetPoints effective
+  // points (lower particle counts buffer longer), capped at 256.
+  _accumBatchTarget() {
+    return Math.max(1, Math.min(256, Math.round(this.accumTargetPoints / this.particlesPerBatch)));
   }
 
   // True when the compute results would differ from the last computed frame.
