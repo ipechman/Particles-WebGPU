@@ -8,14 +8,11 @@ import { mat4 } from "./math.js";
 import { MAX_TRANSFORMS } from "./blender.js";
 
 const WG = 64;                 // generic workgroup size
-const SLOT = 256;              // dynamic uniform slot stride (alignment)
-const MAX_SLOTS = 40;          // generations / LOD levels headroom
-const MAX_LOD = 1 << 20;       // cap on low-detail point count
+const REDUCE_PARTIALS = 1024;  // stage-1 workgroups of the bounds reduction
 const SCENE_FORMAT = "rgba16float"; // HDR offscreen target for post-processing
 
 const SHADER_FILES = {
   iterate: "shaders/iterate.wgsl",
-  lod: "shaders/lod.wgsl",
   reduce: "shaders/reduce.wgsl",
   fit: "shaders/fit.wgsl",
   combine: "shaders/combine.wgsl",
@@ -34,7 +31,6 @@ export class Engine {
     this.particlesPerBatch = 1 << 23;     // 8,388,608 (8.4M)
     this.voxelGridDim = 128;              // grid resolution
     this.voxelBounds = 3.0;               // world-space box size
-    this.lowDetailGenerations = 8;
     this.scalePadding = 0.5;              // flagship fit padding
 
     this.particleColor = [0.93, 0.94, 0.96]; // neutral near-white highlight
@@ -57,7 +53,7 @@ export class Engine {
     this.bloomIterations = 3;       // blur passes -> width/softness of the glow
 
     // sizes currently realized in GPU buffers (for change detection)
-    this._sizes = { particles: -1, lod: -1, voxels: -1 };
+    this._sizes = { particles: -1, voxels: -1 };
 
     // Cache for skipping the attractor/voxel/occlusion recompute when the
     // transforms (and the params they depend on) haven't changed since the last
@@ -161,16 +157,13 @@ export class Engine {
           buf(2, C, "uniform"),
         ],
       }),
-      lod: d.createBindGroupLayout({
+      reduce: d.createBindGroupLayout({
         entries: [
           buf(0, C, "read-only-storage"),
           buf(1, C, "storage"),
-          buf(2, C, "read-only-storage"),
-          buf(3, C, "uniform", true),
+          buf(2, C, "uniform"),
+          buf(3, C, "read-only-storage"),
         ],
-      }),
-      reduce: d.createBindGroupLayout({
-        entries: [buf(0, C, "read-only-storage"), buf(1, C, "storage"), buf(2, C, "uniform")],
       }),
       fit: d.createBindGroupLayout({
         entries: [buf(0, C, "read-only-storage"), buf(1, C, "storage"), buf(2, C, "uniform")],
@@ -232,7 +225,6 @@ export class Engine {
 
     this.pl = {
       iter: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.iter] }),
-      lod: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.lod] }),
       reduce: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.reduce] }),
       fit: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.fit] }),
       combine: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.combine] }),
@@ -251,9 +243,8 @@ export class Engine {
 
     this.pipe = {
       iterate: comp("iterate", "iterate", this.pl.iter),
-      lodFirst: comp("lod", "lodFirst", this.pl.lod),
-      lodIterate: comp("lod", "lodIterate", this.pl.lod),
-      reduce: comp("reduce", "reduce", this.pl.reduce),
+      reducePoints: comp("reduce", "reducePoints", this.pl.reduce),
+      reduceBounds: comp("reduce", "reduceBounds", this.pl.reduce),
       fit: comp("fit", "fit", this.pl.fit),
       combine: comp("combine", "combine", this.pl.combine),
       clearGrids: comp("voxelize", "clearGrids", this.pl.grid),
@@ -324,12 +315,14 @@ export class Engine {
     this.uChaos = d.createBuffer({ size: 32 + MAX_TRANSFORMS * 16, usage: U, label: "uChaos" });
     this.uChaosCPU = new ArrayBuffer(32 + MAX_TRANSFORMS * 16);
 
-    // Dynamic-offset uniform ring (LOD bounds-prediction chain).
-    this.uLod = d.createBuffer({ size: SLOT * MAX_SLOTS, usage: U, label: "uLod" });
-    this.uLodCPU = new Uint32Array((SLOT * MAX_SLOTS) / 4);
+    // Two-stage bounds reduction over the real cloud: per-workgroup partials,
+    // then a single-workgroup fold (see reduce.wgsl).
+    this.partialsBuf = d.createBuffer({ size: REDUCE_PARTIALS * 48, usage: GPUBufferUsage.STORAGE, label: "reducePartials" });
+    this.uReduce1 = d.createBuffer({ size: 16, usage: U, label: "uReduce1" });
+    this.uReduce2 = d.createBuffer({ size: 16, usage: U, label: "uReduce2" });
+    d.queue.writeBuffer(this.uReduce2, 0, new Uint32Array([REDUCE_PARTIALS, 0, 0, 0]));
 
     // Small single-use uniforms.
-    this.uReduce = d.createBuffer({ size: 16, usage: U, label: "uReduce" });
     this.uFit = d.createBuffer({ size: 16, usage: U, label: "uFit" });
     this.uGrid = d.createBuffer({ size: 32, usage: U, label: "uGrid" });
     this.uRender = d.createBuffer({ size: 128, usage: U, label: "uRender" });
@@ -369,6 +362,18 @@ export class Engine {
         { binding: 3, resource: { buffer: this.uCombine } },
       ],
     });
+
+    // Stage 2 of the bounds reduction: partials -> result[0]. (Binding 0 is
+    // unused by the reduceBounds entry; the partials buffer stands in.)
+    this.bgReduce2 = d.createBindGroup({
+      layout: this.bgl.reduce,
+      entries: [
+        { binding: 0, resource: { buffer: this.partialsBuf } },
+        { binding: 1, resource: { buffer: this.reduceResultBuf } },
+        { binding: 2, resource: { buffer: this.uReduce2 } },
+        { binding: 3, resource: { buffer: this.partialsBuf } },
+      ],
+    });
   }
 
   // ---- (re)create sized buffers + dependent bind groups ------------------
@@ -379,17 +384,12 @@ export class Engine {
     // New (empty) position/voxel buffers -> force a recompute next frame.
     this._computeDirty = true;
 
-    this.lodCount = MAX_LOD; // upper bound; recomputed per preset in _schedule
-
     // Positions buffer.
     this.positionsBuf?.destroy();
     this.positionsBuf = d.createBuffer({ size: this.particlesPerBatch * 16, usage: GPUBufferUsage.STORAGE, label: "positions" });
 
-    // LOD ping-pong buffers (sized to the cap; actual N <= cap).
-    this.lodA?.destroy();
-    this.lodB?.destroy();
-    this.lodA = d.createBuffer({ size: MAX_LOD * 16, usage: GPUBufferUsage.STORAGE, label: "lodA" });
-    this.lodB = d.createBuffer({ size: MAX_LOD * 16, usage: GPUBufferUsage.STORAGE, label: "lodB" });
+    // Stage 1 of the bounds reduction reads the whole positions buffer.
+    d.queue.writeBuffer(this.uReduce1, 0, new Uint32Array([this.particlesPerBatch, 0, 0, 0]));
 
     // Voxel occupancy buffer + ambient-occlusion 3D texture. AO lives in a
     // real texture so the render pass gets hardware trilinear filtering.
@@ -417,32 +417,17 @@ export class Engine {
       ],
     });
 
-    const lodEntries = (inBuf, outBuf) => ({
-      layout: this.bgl.lod,
-      entries: [
-        { binding: 0, resource: { buffer: inBuf } },
-        { binding: 1, resource: { buffer: outBuf } },
-        { binding: 2, resource: { buffer: this.transformsBuf } },
-        { binding: 3, resource: { buffer: this.uLod, size: SLOT } },
-      ],
-    });
-    this.bgLodAB = d.createBindGroup(lodEntries(this.lodA, this.lodB)); // in A -> out B
-    this.bgLodBA = d.createBindGroup(lodEntries(this.lodB, this.lodA)); // in B -> out A
-
-    this.bgReduceA = d.createBindGroup({
+    // Stage 1 of the bounds reduction: positions -> per-workgroup partials.
+    // Binding 3 is unused by the reducePoints entry, but it must not alias
+    // the writable partials buffer (usage-conflict validation), so the
+    // result buffer stands in.
+    this.bgReduce1 = d.createBindGroup({
       layout: this.bgl.reduce,
       entries: [
-        { binding: 0, resource: { buffer: this.lodA } },
-        { binding: 1, resource: { buffer: this.reduceResultBuf } },
-        { binding: 2, resource: { buffer: this.uReduce } },
-      ],
-    });
-    this.bgReduceB = d.createBindGroup({
-      layout: this.bgl.reduce,
-      entries: [
-        { binding: 0, resource: { buffer: this.lodB } },
-        { binding: 1, resource: { buffer: this.reduceResultBuf } },
-        { binding: 2, resource: { buffer: this.uReduce } },
+        { binding: 0, resource: { buffer: this.positionsBuf } },
+        { binding: 1, resource: { buffer: this.partialsBuf } },
+        { binding: 2, resource: { buffer: this.uReduce1 } },
+        { binding: 3, resource: { buffer: this.reduceResultBuf } },
       ],
     });
 
@@ -470,7 +455,7 @@ export class Engine {
       ],
     });
 
-    this._sizes = { particles: this.particlesPerBatch, lod: MAX_LOD, voxels: vc };
+    this._sizes = { particles: this.particlesPerBatch, voxels: vc };
   }
 
   // Recreate buffers if a structural size changed.
@@ -485,7 +470,7 @@ export class Engine {
     }
   }
 
-  // Compute the chaos-game / LOD schedule for the current transform count.
+  // Compute the chaos-game schedule for the current transform count.
   _schedule(transformCount) {
     const count = Math.max(transformCount, 1);
 
@@ -497,18 +482,7 @@ export class Engine {
       ? Math.min(40, Math.max(12, Math.ceil(Math.log(this.particlesPerBatch) / Math.log(count)) + 8))
       : 4;
 
-    // LOD generations, capped so the point count stays bounded.
-    let lodGens = this.lowDetailGenerations;
-    if (count >= 2) {
-      const maxByCap = Math.floor(Math.log(MAX_LOD) / Math.log(count));
-      lodGens = Math.min(lodGens, Math.max(1, maxByCap));
-    }
-    lodGens = Math.max(1, Math.min(lodGens, MAX_SLOTS - 1));
-    const N = Math.min(Math.pow(count, lodGens), MAX_LOD);
-    const levels = lodGens - 1; // number of lodIterate dispatches
-    const lodFinalIsA = levels % 2 === 0; // lodFirst writes A; each level swaps
-
-    return { count, iters, lodGens, N, levels, lodFinalIsA };
+    return { count, iters };
   }
 
   resize() {
@@ -653,10 +627,10 @@ export class Engine {
       // on the transforms + scale, so they're rebuilt only when those change.
       // Otherwise the existing buffer contents are reused unchanged.
       this.device.queue.writeBuffer(this.transformsBuf, 0, this.transformData);
-      this._encodePredict(enc, s);
+      this._encodeIterate(enc);
+      this._encodeFit(enc);
       // Fold the freshly fitted final transform into each top-level transform.
       this._dispatch(enc, this.pipe.combine, this.bgCombine, 1);
-      this._encodeIterate(enc);
       this._encodeVoxelize(enc);
       this._encodeRender(enc, transformCount, true, front);
     } else if (mode === "redraw") {
@@ -781,31 +755,14 @@ export class Engine {
     new Float32Array(this.uChaosCPU, 32).set(this._fixedPoints(s.count));
     q.writeBuffer(this.uChaos, 0, this.uChaosCPU);
 
-    // uLod slots: slot 0 = lodFirst (inCount = count); slots 1.. = levels.
-    this.uLodCPU.fill(0);
-    {
-      const o0 = 0;
-      this.uLodCPU[o0 + 0] = s.count;
-      this.uLodCPU[o0 + 1] = s.count;
-      let inCount = s.count;
-      for (let l = 1; l <= s.levels; l++) {
-        const o = (l * SLOT) / 4;
-        this.uLodCPU[o + 0] = s.count;
-        this.uLodCPU[o + 1] = inCount; // size of the input generation
-        inCount = inCount * s.count;
-      }
-    }
-    q.writeBuffer(this.uLod, 0, this.uLodCPU.buffer, 0, (s.levels + 1) * SLOT);
-
-    // uReduce: inputSize = N
-    q.writeBuffer(this.uReduce, 0, new Uint32Array([s.N, 0, 0, 0]));
-
     // uCombine: transformCount
     q.writeBuffer(this.uCombine, 0, new Uint32Array([s.count, 0, 0, 0]));
 
-    // uFit: targetBounds, scalePadding, particleCount(=N as float). The fit
-    // scales the fractal to radius = voxelBounds * scalePadding.
-    q.writeBuffer(this.uFit, 0, new Float32Array([this.voxelBounds, this.scalePadding, s.N, 0]));
+    // uFit: targetBounds, scalePadding, particleCount. The fit scales the
+    // fractal to radius = voxelBounds * scalePadding. The bounds now come
+    // from the exact rendered cloud, so the only slack needed is a small
+    // safety margin for float rounding at the clip boundary.
+    q.writeBuffer(this.uFit, 0, new Float32Array([this.voxelBounds * 0.995, this.scalePadding, this.particlesPerBatch, 0]));
 
     // The voxel grid box tracks the fractal size (= its diameter) so the fixed
     // gridSize always spans the fractal: lighting resolution stays constant as
@@ -849,21 +806,13 @@ export class Engine {
     return { x, y, width: x * WG };
   }
 
-  _encodePredict(enc, s) {
-    // Low-detail generation (ping-pong between A and B).
-    this._dispatch(enc, this.pipe.lodFirst, this.bgLodBA, Math.ceil(s.count / WG), [0]); // out = A
-
-    let outIsA = true;
-    let inCount = s.count;
-    for (let l = 1; l <= s.levels; l++) {
-      outIsA = !outIsA;
-      const bg = outIsA ? this.bgLodBA : this.bgLodAB;
-      this._dispatch(enc, this.pipe.lodIterate, bg, Math.ceil(inCount / WG), [l * SLOT]);
-      inCount = inCount * s.count;
-    }
-
-    // Reduce final LOD buffer -> min/max/sum, then build the auto-fit transform.
-    this._dispatch(enc, this.pipe.reduce, s.lodFinalIsA ? this.bgReduceA : this.bgReduceB, 1);
+  // Measure the freshly iterated cloud (min/max/sum in two reduction stages)
+  // and build the auto-fit transform from it. Because the bounds come from
+  // the exact points that will be rendered, the fractal cannot outgrow the
+  // fitted box and clip.
+  _encodeFit(enc) {
+    this._dispatch(enc, this.pipe.reducePoints, this.bgReduce1, REDUCE_PARTIALS);
+    this._dispatch(enc, this.pipe.reduceBounds, this.bgReduce2, 1);
     this._dispatch(enc, this.pipe.fit, this.bgFit, 1);
   }
 
