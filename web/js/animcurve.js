@@ -3,7 +3,8 @@
 // keyframes) used by SetBlender for "lerp smoothing" of the morph pacing.
 // Keyframes and PingPong wrap mode are taken from the original SampleScene.
 
-const WRAP_PINGPONG = 2;
+export const WRAP_CLAMP = 0;
+export const WRAP_PINGPONG = 2;
 
 // Keyframes copied from SampleScene.unity (the morph easing curve).
 const DEFAULT_KEYS = [

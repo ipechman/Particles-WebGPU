@@ -4,7 +4,7 @@
 // AffineTransformations.AffineFromInstructions.
 
 import { mat4, quat, v3 } from "./math.js";
-import { AnimationCurve } from "./animcurve.js";
+import { AnimationCurve, WRAP_CLAMP } from "./animcurve.js";
 import { buildPreset, identityInstr, addInstr } from "./presets.js";
 
 // Build the final affine matrix for one instruction set entry.
@@ -87,7 +87,12 @@ export class Blender {
     this.moveTowardSet = this.set1.map((x) => ({ ...x }));
     this.blendedSet = this.moveTowardSet;
 
-    this.curve = new AnimationCurve();
+    // The morph-pacing curve eases the rate in from 0 to 1 over ~1s. The
+    // original Unity scene wrapped it PingPong, which makes the rate oscillate
+    // 1 -> 0 -> 1 forever as the ramp clock grows, so the morph visibly
+    // pauses and resumes near its end. Clamp instead: after the ease-in the
+    // rate holds at 1 for a clean exponential landing.
+    this.curve = new AnimationCurve(undefined, WRAP_CLAMP, WRAP_CLAMP);
 
     // Tunables (defaults from SampleScene).
     this.animate = true;
