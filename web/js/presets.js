@@ -135,8 +135,18 @@ export function generateRandomInstr(r = PROCEDURAL_RANGES) {
 }
 
 export function Procedural(count = 3) {
+  // Keep the copies' total volume ratio (count * scale^3) at the 3-transform
+  // sweet spot as the count grows. With a fixed 0.75-0.85 scale range, 5+
+  // copies overlap so heavily that the attractor fills into a structureless
+  // blob; shrinking the scale by (3/count)^(1/3) keeps it lacy and intricate.
+  const f = count > 3 ? Math.cbrt(3 / count) : 1;
+  const r = count > 3 ? {
+    ...PROCEDURAL_RANGES,
+    scaleMin: PROCEDURAL_RANGES.scaleMin.map((s) => s * f),
+    scaleMax: PROCEDURAL_RANGES.scaleMax.map((s) => s * f),
+  } : PROCEDURAL_RANGES;
   const out = [];
-  for (let i = 0; i < count; i++) out.push(generateRandomInstr());
+  for (let i = 0; i < count; i++) out.push(generateRandomInstr(r));
   return out;
 }
 

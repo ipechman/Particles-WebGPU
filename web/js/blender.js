@@ -4,7 +4,7 @@
 // AffineTransformations.AffineFromInstructions.
 
 import { mat4, quat, v3 } from "./math.js";
-import { AnimationCurve } from "./animcurve.js";
+import { AnimationCurve, WRAP_CLAMP } from "./animcurve.js";
 import { buildPreset, identityInstr, addInstr } from "./presets.js";
 
 // Build the final affine matrix for one instruction set entry.
@@ -87,7 +87,12 @@ export class Blender {
     this.moveTowardSet = this.set1.map((x) => ({ ...x }));
     this.blendedSet = this.moveTowardSet;
 
-    this.curve = new AnimationCurve();
+    // The morph-pacing curve eases the rate in from 0 to 1 over ~1s. The
+    // original Unity scene wrapped it PingPong, which makes the rate oscillate
+    // 1 -> 0 -> 1 forever as the ramp clock grows, so the morph visibly
+    // pauses and resumes near its end. Clamp instead: after the ease-in the
+    // rate holds at 1 for a clean exponential landing.
+    this.curve = new AnimationCurve(undefined, WRAP_CLAMP, WRAP_CLAMP);
 
     // Tunables (defaults from SampleScene).
     this.animate = true;
@@ -265,10 +270,42 @@ export class Blender {
     const n = Math.min(this.moveTowardSet.length, this.set2.length);
     for (let i = 0; i < n; i++) {
       this.moveTowardSet[i] = this._morphInstr(i, dt);
+      this._snapIfSettled(i);
       out.push(this.moveTowardSet[i]);
     }
     this.blendedSet = out;
     return out;
+  }
+
+  // Snap an asymptotically converging morph onto its exact target once every
+  // channel is imperceptibly close (< 1e-4). Lerp smoothing otherwise keeps
+  // the matrices micro-changing for many seconds after the form has visually
+  // settled, which forces the GPU to recompute every frame and starves the
+  // engine's static-frame accumulation.
+  _snapIfSettled(i) {
+    const EPS = 1e-4;
+    const cur = this.moveTowardSet[i];
+    const t = this.set2[i];
+    const close = (a, b) =>
+      Math.abs(a[0] - b[0]) < EPS && Math.abs(a[1] - b[1]) < EPS && Math.abs(a[2] - b[2]) < EPS;
+    if (
+      !close(cur.scale, t.scale) || !close(cur.shearX, t.shearX) ||
+      !close(cur.shearY, t.shearY) || !close(cur.shearZ, t.shearZ) ||
+      !close(cur.translate, t.translate)
+    ) return;
+    // q and -q are the same rotation: sign-align before comparing components.
+    const dot = cur.rot[0] * t.rot[0] + cur.rot[1] * t.rot[1] + cur.rot[2] * t.rot[2] + cur.rot[3] * t.rot[3];
+    const sg = dot < 0 ? -1 : 1;
+    for (let k = 0; k < 4; k++) {
+      if (Math.abs(cur.rot[k] - sg * t.rot[k]) >= EPS) return;
+    }
+    if (this.morphMode === "spring") {
+      // Don't clip the bounce: only snap once the spring has lost its energy.
+      const v = this.velSet[i];
+      const still = (a) => Math.abs(a[0]) < 1e-3 && Math.abs(a[1]) < 1e-3 && Math.abs(a[2]) < 1e-3;
+      if (!still(v.scale) || !still(v.shearX) || !still(v.shearY) || !still(v.shearZ) || !still(v.translate)) return;
+    }
+    this.moveTowardSet[i] = cloneInstr(t);
   }
 
   // Pack the current blended set into a column-major Float32Array of

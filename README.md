@@ -42,8 +42,11 @@ The graphical pipeline mirrors the Unity project one-to-one:
 1. **Generating functions** — the six classic presets (Sierpinski Triangle /
    Vicsek / Sierpinski Carpet, 2D and 3D) plus a procedural random generator,
    each producing a set of affine transforms.
-2. **Iterated system** — a compute shader builds the attractor point cloud by
-   recursively applying every transform, one generation per dispatch.
+2. **Iterated system** — a compute shader builds the attractor point cloud
+   with a deterministic per-particle chaos game in a single dispatch: each
+   particle starts on a transform's fixed point (an exact attractor point) and
+   applies a hash-driven sequence of transforms, so every rendered point lies
+   on the attractor.
 3. **Auto-fit** — a low-detail copy of the attractor is reduced (min/max/sum on
    the GPU) to predict a bounding box, and a "final transform" rescales and
    recenters the fractal to fill the view.

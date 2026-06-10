@@ -16,10 +16,13 @@ struct Grid {
 };
 
 @group(0) @binding(0) var<storage, read> positions: array<vec3<f32>>;
-@group(0) @binding(1) var<storage, read> transforms: array<mat4x4<f32>>;
+// combined[i] = finalTransform * transforms[i] (see combine.wgsl)
+@group(0) @binding(1) var<storage, read> combined: array<mat4x4<f32>>;
 @group(0) @binding(2) var<storage, read> finalTransform: array<mat4x4<f32>>;
 @group(0) @binding(3) var<storage, read_write> voxelGrid: array<u32>;
-@group(0) @binding(4) var<storage, read_write> occlusionGrid: array<f32>;
+// AO is written to a real 3D texture so the render pass can sample it with
+// one hardware-filtered trilinear tap instead of 8 buffer loads.
+@group(0) @binding(4) var occlusionTex: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(5) var<uniform> u: Grid;
 
 fn to1D(p: vec3<u32>) -> u32 {
@@ -54,7 +57,7 @@ fn clearGrids(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= u.voxelCount) { return; }
   voxelGrid[i] = 0u;
-  occlusionGrid[i] = 0.0;
+  // occlusionTex needs no clear: the occlusion pass writes every voxel.
 }
 
 @compute @workgroup_size(64)
@@ -72,7 +75,7 @@ fn voxelize(@builtin(global_invocation_id) gid: vec3<u32>) {
   // ...and its image under each top-level transform (matches the instanced
   // render, which draws transformCount copies).
   for (var i = 0u; i < u.transformCount; i = i + 1u) {
-    let p = ft * (transforms[i] * vec4<f32>(pos, 1.0));
+    let p = combined[i] * vec4<f32>(pos, 1.0);
     mark(p.xyz);
   }
 }
@@ -99,5 +102,5 @@ fn occlusion(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   let occ = f32(neighborCount) / 27.0;
-  occlusionGrid[i] = 1.0 - occ;
+  textureStore(occlusionTex, to3D(i), vec4<f32>(1.0 - occ, 0.0, 0.0, 0.0));
 }
