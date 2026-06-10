@@ -18,6 +18,7 @@ const SHADER_FILES = {
   lod: "shaders/lod.wgsl",
   reduce: "shaders/reduce.wgsl",
   fit: "shaders/fit.wgsl",
+  combine: "shaders/combine.wgsl",
   voxelize: "shaders/voxelize.wgsl",
   render: "shaders/render.wgsl",
   post: "shaders/post.wgsl",
@@ -167,13 +168,21 @@ export class Engine {
       fit: d.createBindGroupLayout({
         entries: [buf(0, C, "read-only-storage"), buf(1, C, "storage"), buf(2, C, "uniform")],
       }),
+      combine: d.createBindGroupLayout({
+        entries: [
+          buf(0, C, "read-only-storage"),
+          buf(1, C, "read-only-storage"),
+          buf(2, C, "storage"),
+          buf(3, C, "uniform"),
+        ],
+      }),
       grid: d.createBindGroupLayout({
         entries: [
           buf(0, C, "read-only-storage"),
           buf(1, C, "read-only-storage"),
           buf(2, C, "read-only-storage"),
           buf(3, C, "storage"),
-          buf(4, C, "storage"),
+          { binding: 4, visibility: C, storageTexture: { access: "write-only", format: "rgba16float", viewDimension: "3d" } },
           buf(5, C, "uniform"),
         ],
       }),
@@ -182,8 +191,9 @@ export class Engine {
           buf(0, VF, "read-only-storage"),
           buf(1, VF, "read-only-storage"),
           buf(2, VF, "read-only-storage"),
-          buf(3, VF, "read-only-storage"),
+          { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
           buf(4, VF, "uniform"),
+          { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
         ],
       }),
       // Post passes: sampler + input texture + params.
@@ -218,6 +228,7 @@ export class Engine {
       lod: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.lod] }),
       reduce: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.reduce] }),
       fit: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.fit] }),
+      combine: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.combine] }),
       grid: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.grid] }),
       render: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.render] }),
       post: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.post] }),
@@ -237,6 +248,7 @@ export class Engine {
       lodIterate: comp("lod", "lodIterate", this.pl.lod),
       reduce: comp("reduce", "reduce", this.pl.reduce),
       fit: comp("fit", "fit", this.pl.fit),
+      combine: comp("combine", "combine", this.pl.combine),
       clearGrids: comp("voxelize", "clearGrids", this.pl.grid),
       voxelize: comp("voxelize", "voxelize", this.pl.grid),
       occlusion: comp("voxelize", "occlusion", this.pl.grid),
@@ -296,6 +308,10 @@ export class Engine {
     this.transformsBuf = d.createBuffer({ size: MAX_TRANSFORMS * 64, usage: S, label: "transforms" });
     this.finalTransformBuf = d.createBuffer({ size: 64, usage: S, label: "finalTransform" });
     this.reduceResultBuf = d.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE, label: "reduceResult" });
+    // combined[i] = finalTransform * transforms[i], premultiplied on the GPU
+    // after the fit pass (combine.wgsl) so render/voxelize apply one matrix.
+    this.combinedBuf = d.createBuffer({ size: MAX_TRANSFORMS * 64, usage: GPUBufferUsage.STORAGE, label: "combined" });
+    this.uCombine = d.createBuffer({ size: 16, usage: U, label: "uCombine" });
 
     // Chaos-game uniform: 32-byte header + per-transform fixed-point seeds.
     this.uChaos = d.createBuffer({ size: 32 + MAX_TRANSFORMS * 16, usage: U, label: "uChaos" });
@@ -336,6 +352,16 @@ export class Engine {
         { binding: 2, resource: { buffer: this.uFit } },
       ],
     });
+
+    this.bgCombine = d.createBindGroup({
+      layout: this.bgl.combine,
+      entries: [
+        { binding: 0, resource: { buffer: this.transformsBuf } },
+        { binding: 1, resource: { buffer: this.finalTransformBuf } },
+        { binding: 2, resource: { buffer: this.combinedBuf } },
+        { binding: 3, resource: { buffer: this.uCombine } },
+      ],
+    });
   }
 
   // ---- (re)create sized buffers + dependent bind groups ------------------
@@ -358,12 +384,21 @@ export class Engine {
     this.lodA = d.createBuffer({ size: MAX_LOD * 16, usage: GPUBufferUsage.STORAGE, label: "lodA" });
     this.lodB = d.createBuffer({ size: MAX_LOD * 16, usage: GPUBufferUsage.STORAGE, label: "lodB" });
 
-    // Voxel + occlusion grids.
+    // Voxel occupancy buffer + ambient-occlusion 3D texture. AO lives in a
+    // real texture so the render pass gets hardware trilinear filtering.
     this.voxelGrid?.destroy();
-    this.occlusionGrid?.destroy();
+    this.occlusionTex?.destroy();
     const vc = this.voxelCount;
+    const dim = this.voxelGridDim;
     this.voxelGrid = d.createBuffer({ size: vc * 4, usage: S, label: "voxelGrid" });
-    this.occlusionGrid = d.createBuffer({ size: vc * 4, usage: GPUBufferUsage.STORAGE, label: "occlusionGrid" });
+    this.occlusionTex = d.createTexture({
+      size: [dim, dim, dim],
+      dimension: "3d",
+      format: "rgba16float",
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+      label: "occlusionTex",
+    });
+    this.occlusionView = this.occlusionTex.createView();
 
     // Bind groups.
     this.bgIter = d.createBindGroup({
@@ -408,10 +443,10 @@ export class Engine {
       layout: this.bgl.grid,
       entries: [
         { binding: 0, resource: { buffer: this.positionsBuf } },
-        { binding: 1, resource: { buffer: this.transformsBuf } },
+        { binding: 1, resource: { buffer: this.combinedBuf } },
         { binding: 2, resource: { buffer: this.finalTransformBuf } },
         { binding: 3, resource: { buffer: this.voxelGrid } },
-        { binding: 4, resource: { buffer: this.occlusionGrid } },
+        { binding: 4, resource: this.occlusionView },
         { binding: 5, resource: { buffer: this.uGrid } },
       ],
     });
@@ -420,10 +455,11 @@ export class Engine {
       layout: this.bgl.render,
       entries: [
         { binding: 0, resource: { buffer: this.positionsBuf } },
-        { binding: 1, resource: { buffer: this.transformsBuf } },
+        { binding: 1, resource: { buffer: this.combinedBuf } },
         { binding: 2, resource: { buffer: this.finalTransformBuf } },
-        { binding: 3, resource: { buffer: this.occlusionGrid } },
+        { binding: 3, resource: this.occlusionView },
         { binding: 4, resource: { buffer: this.uRender } },
+        { binding: 5, resource: this.sampler },
       ],
     });
 
@@ -595,6 +631,8 @@ export class Engine {
       // Otherwise the existing buffer contents are reused unchanged.
       this.device.queue.writeBuffer(this.transformsBuf, 0, this.transformData);
       this._encodePredict(enc, s);
+      // Fold the freshly fitted final transform into each top-level transform.
+      this._dispatch(enc, this.pipe.combine, this.bgCombine, 1);
       this._encodeIterate(enc);
       this._encodeVoxelize(enc);
       this._encodeRender(enc, transformCount, true);
@@ -713,6 +751,9 @@ export class Engine {
 
     // uReduce: inputSize = N
     q.writeBuffer(this.uReduce, 0, new Uint32Array([s.N, 0, 0, 0]));
+
+    // uCombine: transformCount
+    q.writeBuffer(this.uCombine, 0, new Uint32Array([s.count, 0, 0, 0]));
 
     // uFit: targetBounds, scalePadding, particleCount(=N as float). The fit
     // scales the fractal to radius = voxelBounds * scalePadding.

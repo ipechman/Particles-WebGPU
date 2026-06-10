@@ -21,10 +21,12 @@ struct Render {
 };
 
 @group(0) @binding(0) var<storage, read> positions: array<vec3<f32>>;
-@group(0) @binding(1) var<storage, read> transforms: array<mat4x4<f32>>;
-@group(0) @binding(2) var<storage, read> finalTransform: array<mat4x4<f32>>;
-@group(0) @binding(3) var<storage, read> occlusionGrid: array<f32>;
+// combined[i] = finalTransform * transforms[i], premultiplied by combine.wgsl
+// so each of the ~25M instanced vertices applies a single matrix.
+@group(0) @binding(1) var<storage, read> combined: array<mat4x4<f32>>;
+@group(0) @binding(3) var occlusionTex: texture_3d<f32>;
 @group(0) @binding(4) var<uniform> u: Render;
+@group(0) @binding(5) var occlusionSampler: sampler;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -32,37 +34,18 @@ struct VOut {
   @location(1) oob: f32,
 };
 
-fn to1D(p: vec3<u32>) -> u32 {
-  return p.x + p.y * u.gridSize + p.z * u.gridSize * u.gridSize;
-}
-
 fn getTrilinearVoxel(pos: vec3<f32>) -> f32 {
   var v = 0.0;
   let boundsExtent = u.gridBounds;
 
   if (abs(pos.x) <= boundsExtent && abs(pos.y) <= boundsExtent && abs(pos.z) <= boundsExtent) {
-    var seedPos = pos + vec3<f32>(u.gridBounds * 0.5);
-    seedPos = seedPos / u.gridBounds;
-    seedPos = seedPos * f32(u.gridSize);
-
-    let vi = vec3<u32>(floor(seedPos));
-    let g = u.gridSize;
-    var value = 0.0;
-
-    for (var i = 0u; i < 2u; i = i + 1u) {
-      let w1 = 1.0 - min(abs(seedPos.x - f32(vi.x + i)), f32(g));
-      for (var j = 0u; j < 2u; j = j + 1u) {
-        let w2 = 1.0 - min(abs(seedPos.y - f32(vi.y + j)), f32(g));
-        for (var k = 0u; k < 2u; k = k + 1u) {
-          let w3 = 1.0 - min(abs(seedPos.z - f32(vi.z + k)), f32(g));
-          let c = vi + vec3<u32>(i, j, k);
-          if (c.x < g && c.y < g && c.z < g) {
-            value = value + w1 * w2 * w3 * occlusionGrid[to1D(c)];
-          }
-        }
-      }
-    }
-    v = value;
+    // Normalized grid coordinate, shifted half a texel so the hardware
+    // trilinear filter interpolates on the voxel lattice exactly like the
+    // manual 8-tap loop this replaces (voxel i's value lives at texel
+    // center (i + 0.5) / gridSize).
+    let uvw = (pos + vec3<f32>(u.gridBounds * 0.5)) / u.gridBounds
+            + vec3<f32>(0.5 / f32(u.gridSize));
+    v = textureSampleLevel(occlusionTex, occlusionSampler, uvw, 0.0).r;
   }
   return v;
 }
@@ -70,7 +53,7 @@ fn getTrilinearVoxel(pos: vec3<f32>) -> f32 {
 @vertex
 fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOut {
   let basePos = positions[vid];
-  let world = finalTransform[0] * (transforms[iid] * vec4<f32>(basePos, 1.0));
+  let world = combined[iid] * vec4<f32>(basePos, 1.0);
 
   let halfBounds = u.gridBounds * 0.5;
   var oob = 0.0;
