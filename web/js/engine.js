@@ -47,8 +47,10 @@ export class Engine {
     this.kuwaharaAlpha = 1.0;
     this.kuwaharaZeroCrossing = 0.58;
     this.kuwaharaBlurRadius = 2;
-    this.bloomIntensity = 2.85;     // 0 disables bloom
-    this.bloomThreshold = 0.3;      // low enough that bloom is visible on most fractals
+    // Retuned for the accumulated (much denser, brighter) resting image: only
+    // genuinely bright areas should glow, not the whole fractal.
+    this.bloomIntensity = 1.5;      // 0 disables bloom
+    this.bloomThreshold = 0.6;
     this.bloomSpread = 2.0;
     this.bloomIterations = 3;       // blur passes -> width/softness of the glow
 
