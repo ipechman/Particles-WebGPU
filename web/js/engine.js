@@ -518,15 +518,25 @@ export class Engine {
 
     const d = this.device;
     const RT = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+    // Scene + depth are double-buffered: accumulation bakes extra batches into
+    // the hidden back pair while the front pair keeps being presented, then
+    // the roles swap. Both need copy usage to seed the back from the front.
+    const CP = GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
     const hw = Math.max(1, w >> 1);
     const hh = Math.max(1, h >> 1);
 
-    this.depthTex?.destroy();
-    this.depthTex = d.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT });
-    this.depthView = this.depthTex.createView();
+    for (const t of this.depthTexs ?? []) t?.destroy();
+    for (const t of this.sceneTexs ?? []) t?.destroy();
+    for (const t of [this.kuwaharaTex, this.bloomA, this.bloomB, this.tensorA, this.tensorB]) t?.destroy();
 
-    for (const t of [this.sceneTex, this.kuwaharaTex, this.bloomA, this.bloomB, this.tensorA, this.tensorB]) t?.destroy();
-    this.sceneTex = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "sceneTex" });
+    this.depthTexs = [0, 1].map((i) =>
+      d.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT | CP, label: `depth${i}` }));
+    this.sceneTexs = [0, 1].map((i) =>
+      d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT | CP, label: `sceneTex${i}` }));
+    this.depthViews = this.depthTexs.map((t) => t.createView());
+    this.sceneViews = this.sceneTexs.map((t) => t.createView());
+    this._front = 0;
+
     this.kuwaharaTex = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "kuwaharaTex" });
     this.bloomA = d.createTexture({ size: [hw, hh], format: SCENE_FORMAT, usage: RT, label: "bloomA" });
     this.bloomB = d.createTexture({ size: [hw, hh], format: SCENE_FORMAT, usage: RT, label: "bloomB" });
@@ -534,7 +544,6 @@ export class Engine {
     this.tensorA = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "tensorA" });
     this.tensorB = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "tensorB" });
 
-    this.sceneView = this.sceneTex.createView();
     this.kuwaharaView = this.kuwaharaTex.createView();
     this.bloomAView = this.bloomA.createView();
     this.bloomBView = this.bloomB.createView();
@@ -562,12 +571,13 @@ export class Engine {
       });
 
     // Bloom prefilter reads whichever image is the post-Kuwahara result; blur
-    // ping-pongs between the two half-res targets.
-    this.bgPreFromScene = postBG(this.sceneView, this.uPre);
+    // ping-pongs between the two half-res targets. Bind groups that read the
+    // scene exist per scene buffer (post always reads the front one).
+    this.bgPreFromScene = this.sceneViews.map((v) => postBG(v, this.uPre));
     this.bgPreFromKuw = postBG(this.kuwaharaView, this.uPre);
     this.bgBlurH = postBG(this.bloomAView, this.uBlurH);
     this.bgBlurV = postBG(this.bloomBView, this.uBlurV);
-    this.bgPresentScene = presentBG(this.sceneView);
+    this.bgPresentScene = this.sceneViews.map((v) => presentBG(v));
     this.bgPresentKuw = presentBG(this.kuwaharaView);
 
     // Anisotropic Kuwahara passes (binding 1 is unused by the first three).
@@ -580,10 +590,10 @@ export class Engine {
           { binding: 2, resource: { buffer: this.uKuw } },
         ],
       });
-    this.bgKuwStructure = kuwBG(this.sceneView, this.sceneView);   // scene -> tensorA
-    this.bgKuwBlurH = kuwBG(this.tensorAView, this.tensorAView);   // tensorA -> tensorB
-    this.bgKuwAniso = kuwBG(this.tensorBView, this.tensorBView);   // tensorB -> tensorA (flow map)
-    this.bgKuwFilter = kuwBG(this.sceneView, this.tensorAView);    // scene + flow map -> kuwaharaTex
+    this.bgKuwStructure = this.sceneViews.map((v) => kuwBG(v, v));                  // scene -> tensorA
+    this.bgKuwBlurH = kuwBG(this.tensorAView, this.tensorAView);                    // tensorA -> tensorB
+    this.bgKuwAniso = kuwBG(this.tensorBView, this.tensorBView);                    // tensorB -> tensorA (flow map)
+    this.bgKuwFilter = this.sceneViews.map((v) => kuwBG(v, this.tensorAView));      // scene + flow map -> kuwaharaTex
   }
 
   // ---- the per-frame pipeline --------------------------------------------
@@ -607,24 +617,25 @@ export class Engine {
     const renderStale = this._renderStale(rb);
     let mode;
     if (recompute) {
-      mode = "compute"; // rebuild attractor + grids, draw from scratch
+      mode = "compute"; // rebuild attractor + grids, draw the front from scratch
       this._batchSeed = 0;
       this._accumCount = 1;
     } else if (renderStale) {
-      mode = "redraw"; // same cloud, new camera/colors: draw from scratch
+      mode = "redraw"; // same cloud, new camera/colors: draw the front from scratch
       this._accumCount = 1;
     } else if (this._accumCount < this.accumBatches) {
-      mode = "accumulate"; // bake one more independent batch into the scene
+      mode = "accumulate"; // bake one more batch into the hidden back buffer
       this._batchSeed = this._accumCount;
-      this._accumCount++;
     } else {
-      mode = "idle"; // scene texture is final: post/present only
+      mode = "idle"; // front holds the final accumulated image: post/present only
     }
 
     this._writeUniforms(s, rb);
     this._writePostUniforms();
 
     const enc = this.device.createCommandEncoder();
+    const front = this._front;
+    const back = 1 - front;
     if (mode === "compute") {
       // The attractor, voxel grid, occlusion and fit transform all depend only
       // on the transforms + scale, so they're rebuilt only when those change.
@@ -635,14 +646,27 @@ export class Engine {
       this._dispatch(enc, this.pipe.combine, this.bgCombine, 1);
       this._encodeIterate(enc);
       this._encodeVoxelize(enc);
-      this._encodeRender(enc, transformCount, true);
+      this._encodeRender(enc, transformCount, true, front);
     } else if (mode === "redraw") {
       // The positions buffer holds whichever batch was baked last, so the
       // next accumulation run may re-draw one batch. Harmless: same points.
-      this._encodeRender(enc, transformCount, true);
+      this._encodeRender(enc, transformCount, true, front);
     } else if (mode === "accumulate") {
+      // Accumulation happens off-screen: the front image stays on display
+      // untouched while batches bake into the back buffer, and the buffers
+      // swap only once the full set is baked. The user never sees a
+      // partially accumulated in-between state.
+      if (this._accumCount === 1) {
+        const size = [this._fbW, this._fbH, 1];
+        enc.copyTextureToTexture({ texture: this.sceneTexs[front] }, { texture: this.sceneTexs[back] }, size);
+        enc.copyTextureToTexture({ texture: this.depthTexs[front] }, { texture: this.depthTexs[back] }, size);
+      }
       this._encodeIterate(enc);
-      this._encodeRender(enc, transformCount, false);
+      this._encodeRender(enc, transformCount, false, back);
+      this._accumCount++;
+      if (this._accumCount >= this.accumBatches) {
+        this._front = back; // completed: present the dense image from now on
+      }
     }
     this._encodePost(enc);
     this.device.queue.submit([enc.finish()]);
@@ -857,20 +881,20 @@ export class Engine {
     this._dispatch(enc, this.pipe.occlusion, this.bgGrid, vGroups);
   }
 
-  // Draw the point cloud into the scene texture. With clear=false the pass
-  // loads the existing color + depth instead, so a fresh chaos batch adds to
-  // what previous batches already drew (progressive accumulation).
-  _encodeRender(enc, transformCount, clear) {
+  // Draw the point cloud into scene buffer `target`. With clear=false the
+  // pass loads the existing color + depth instead, so a fresh chaos batch
+  // adds to what previous batches already drew (progressive accumulation).
+  _encodeRender(enc, transformCount, clear, target) {
     const bg = this.backgroundColor;
     const p = enc.beginRenderPass({
       colorAttachments: [{
-        view: this.sceneView,
+        view: this.sceneViews[target],
         clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 },
         loadOp: clear ? "clear" : "load",
         storeOp: "store",
       }],
       depthStencilAttachment: {
-        view: this.depthView,
+        view: this.depthViews[target],
         depthClearValue: 1.0,
         depthLoadOp: clear ? "clear" : "load",
         depthStoreOp: "store",
@@ -914,16 +938,20 @@ export class Engine {
   }
 
   _encodePost(enc) {
+    // Post always reads the FRONT scene buffer; accumulation renders into the
+    // back one, so partially accumulated frames are never visible.
+    const f = this._front;
+
     // 1) Optional anisotropic Kuwahara filter (4 passes -> kuwaharaTex).
     const useKuwahara = this.kuwaharaEnabled;
     if (useKuwahara) {
-      this._fullscreen(enc, this.pipe.kuwStructure, this.bgKuwStructure, this.tensorAView); // scene -> tensorA
-      this._fullscreen(enc, this.pipe.kuwBlurH, this.bgKuwBlurH, this.tensorBView);         // tensorA -> tensorB
-      this._fullscreen(enc, this.pipe.kuwAniso, this.bgKuwAniso, this.tensorAView);         // tensorB -> tensorA (flow map)
-      this._fullscreen(enc, this.pipe.kuwFilter, this.bgKuwFilter, this.kuwaharaView);      // scene + flow map -> kuwaharaTex
+      this._fullscreen(enc, this.pipe.kuwStructure, this.bgKuwStructure[f], this.tensorAView); // scene -> tensorA
+      this._fullscreen(enc, this.pipe.kuwBlurH, this.bgKuwBlurH, this.tensorBView);            // tensorA -> tensorB
+      this._fullscreen(enc, this.pipe.kuwAniso, this.bgKuwAniso, this.tensorAView);            // tensorB -> tensorA (flow map)
+      this._fullscreen(enc, this.pipe.kuwFilter, this.bgKuwFilter[f], this.kuwaharaView);      // scene + flow map -> kuwaharaTex
     }
-    const bgPrefilter = useKuwahara ? this.bgPreFromKuw : this.bgPreFromScene;
-    const bgPresent = useKuwahara ? this.bgPresentKuw : this.bgPresentScene;
+    const bgPrefilter = useKuwahara ? this.bgPreFromKuw : this.bgPreFromScene[f];
+    const bgPresent = useKuwahara ? this.bgPresentKuw : this.bgPresentScene[f];
 
     // 2) Optional bloom: bright-pass, then several separable blur iterations
     //    (each H+V pass widens and softens the glow).
