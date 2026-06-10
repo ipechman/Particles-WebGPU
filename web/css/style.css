@@ -5,6 +5,9 @@
   --text: #e8e8ec;
   --muted: #8a8a92;
   --accent: #7fd8c4;
+  /* Render native widgets (select popups, scrollbars) dark: without this the
+     OS draws the dropdown list white while the options inherit light text. */
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -134,6 +137,12 @@ select {
   border: 1px solid var(--line);
   border-radius: 7px;
   padding: 5px 8px;
+}
+
+/* Fallback for browsers that style the option list directly. */
+select option {
+  background: #141418;
+  color: var(--text);
 }
 
 button.full {
