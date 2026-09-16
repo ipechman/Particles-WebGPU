@@ -35,6 +35,28 @@ Needs a WebGPU-capable browser (recent Chrome / Edge / Chromium).
 - **Post-processing**: a toggle for the original **Kuwahara filter** (Acerola's
   edge-preserving painterly filter) and a **bloom** slider (0 disables it).
 
+### Reference color palettes
+
+The **Theme** dropdown includes three palettes inspired by the supplied fractal
+references, in the same order:
+
+| Theme | Palette |
+| --- | --- |
+| Gilded Lagoon | Deep navy, turquoise, seafoam, amber, pale gold, cream |
+| Amber Fern | Blue-black, muted teal, copper, warm gold, yellow, pale cream |
+| Glacial Ember | Midnight blue, burnt orange, amber, blue-teal, aqua, icy white |
+
+These themes map ambient-occlusion lighting through six color stops on a black
+background. The gradient below the color controls previews the shadow-to-highlight
+sequence. **Color** and **Shadow** edit its endpoints; the four **Accents** swatches
+edit the intermediate colors. Editing any swatch selects **Custom**; reselecting a
+theme restores its original colors. The original themes retain their two-color
+blend. Palette selection leaves the shape, lighting and post-processing settings
+as they are, so the exact appearance depends on the current fractal and AO/bloom.
+
+Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
+(Node.js 22.7 or newer; no dependencies or build step required).
+
 ## What it does (preserved from the original)
 
 The graphical pipeline mirrors the Unity project one-to-one:

@@ -15,9 +15,11 @@ struct Render {
   gridBounds: f32,
   occlusionMultiplier: f32,
   occlusionAttenuation: f32,
-  _p0: f32,
+  paletteStopCount: u32,
   _p1: f32,
   _p2: f32,
+  // .rgb = color, .w = AO position. Matches MAX_PALETTE_STOPS in themes.js.
+  paletteStops: array<vec4<f32>, 6>,
 };
 
 @group(0) @binding(0) var<storage, read> positions: array<vec3<f32>>;
@@ -68,6 +70,23 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOu
   return o;
 }
 
+fn paletteColor(light: f32) -> vec3<f32> {
+  if (u.paletteStopCount < 2u) {
+    return mix(u.occlusionColor.rgb, u.particleColor.rgb, light);
+  }
+
+  var previous = u.paletteStops[0];
+  for (var stop = 1u; stop < min(u.paletteStopCount, 6u); stop++) {
+    let next = u.paletteStops[stop];
+    if (light <= next.w) {
+      let t = clamp((light - previous.w) / max(next.w - previous.w, 0.00001), 0.0, 1.0);
+      return mix(previous.rgb, next.rgb, t);
+    }
+    previous = next;
+  }
+  return previous.rgb;
+}
+
 @fragment
 fn fs(i: VOut) -> @location(0) vec4<f32> {
   if (i.oob > 0.5) { discard; }
@@ -75,6 +94,6 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
   var occlusion = getTrilinearVoxel(i.worldPos);
   occlusion = pow(clamp(occlusion * u.occlusionMultiplier, 0.0, 1.0), u.occlusionAttenuation);
 
-  let col = mix(u.occlusionColor.rgb, u.particleColor.rgb, occlusion);
+  let col = paletteColor(occlusion);
   return vec4<f32>(col, 1.0);
 }
