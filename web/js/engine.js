@@ -6,10 +6,12 @@
 
 import { mat4 } from "./math.js";
 import { MAX_TRANSFORMS } from "./blender.js";
+import { MAX_PALETTE_STOPS } from "./themes.js";
 
 const WG = 64;                 // generic workgroup size
 const REDUCE_PARTIALS = 1024;  // stage-1 workgroups of the bounds reduction
 const SCENE_FORMAT = "rgba16float"; // HDR offscreen target for post-processing
+const RENDER_UNIFORM_SIZE = 128 + MAX_PALETTE_STOPS * 16;
 
 const SHADER_FILES = {
   iterate: "shaders/iterate.wgsl",
@@ -38,6 +40,7 @@ export class Engine {
     this.occlusionMultiplier = 1.0;
     this.occlusionAttenuation = 1.0;
     this.backgroundColor = [0.0, 0.0, 0.0];
+    this.paletteStops = []; // empty preserves the original two-color shading
 
     // ---- post-processing ----
     // Anisotropic Kuwahara filter (Acerola). Painterly, flow-aligned.
@@ -329,7 +332,7 @@ export class Engine {
     // Small single-use uniforms.
     this.uFit = d.createBuffer({ size: 16, usage: U, label: "uFit" });
     this.uGrid = d.createBuffer({ size: 32, usage: U, label: "uGrid" });
-    this.uRender = d.createBuffer({ size: 128, usage: U, label: "uRender" });
+    this.uRender = d.createBuffer({ size: RENDER_UNIFORM_SIZE, usage: U, label: "uRender" });
 
     // Post-processing uniforms (PostParams / PresentParams are 32 bytes each).
     this.uKuw = d.createBuffer({ size: 32, usage: U, label: "uKuw" });
@@ -710,12 +713,21 @@ export class Engine {
     const gridBounds = 2 * this.voxelBounds * this.scalePadding;
     const aspect = this.canvas.width / Math.max(1, this.canvas.height);
     const vp = camera.viewProj(aspect);
-    const rb = new ArrayBuffer(128);
+    const rb = new ArrayBuffer(RENDER_UNIFORM_SIZE);
     new Float32Array(rb, 0, 16).set(vp);
     new Float32Array(rb, 64, 4).set([...this.particleColor, 1]);
     new Float32Array(rb, 80, 4).set([...this.occlusionColor, 1]);
     new Uint32Array(rb, 96, 2).set([dim, s.count]);
     new Float32Array(rb, 104, 3).set([gridBounds, this.occlusionMultiplier, this.occlusionAttenuation]);
+    const stops = this.paletteStops;
+    const count = Math.min(stops.length, MAX_PALETTE_STOPS);
+    new Uint32Array(rb, 116, 1)[0] = count;
+    for (let i = 0; i < count; i++) {
+      // The existing Color / Shadow controls remain the ramp's endpoints.
+      const color = i === 0 ? this.occlusionColor
+        : i === count - 1 ? this.particleColor : stops[i].color;
+      new Float32Array(rb, 128 + i * 16, 4).set([...color, stops[i].position]);
+    }
     return rb;
   }
 

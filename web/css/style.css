@@ -36,6 +36,10 @@ html, body {
   top: 14px;
   left: 14px;
   width: 248px;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 28px);
+  max-height: calc(100dvh - 28px);
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -47,6 +51,7 @@ html, body {
 }
 
 #ui header {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -68,6 +73,8 @@ html, body {
 }
 
 #ui .body {
+  min-height: 0;
+  overflow-y: auto;
   padding: 10px 14px 4px;
   display: flex;
   flex-direction: column;
@@ -98,6 +105,15 @@ html, body {
   gap: 6px;
 }
 .row.colors span { color: var(--muted); }
+#palettePreview {
+  height: 12px;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.row.palette-accents { gap: 6px; }
+.row.palette-accents > span { flex: 1; }
+.row.palette-accents[hidden] { display: none; }
 .val {
   flex: 0 0 auto;
   width: 26px;
@@ -192,6 +208,7 @@ input[type="range"]::-moz-range-thumb {
 }
 
 #ui footer {
+  flex-shrink: 0;
   padding: 8px 14px 10px;
   color: var(--muted);
   border-top: 1px solid var(--line);

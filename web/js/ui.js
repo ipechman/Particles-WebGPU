@@ -3,7 +3,7 @@
 
 import { PRESET_LABELS } from "./presets.js";
 import { MORPH_FUNCTIONS } from "./blender.js";
-import { THEMES, findTheme } from "./themes.js";
+import { THEMES, applyTheme } from "./themes.js";
 import { getSavedShapes, addSavedShape, deleteSavedShape } from "./storage.js";
 
 const hex2rgb = (h) => {
@@ -82,16 +82,50 @@ export function buildUI(engine, blender, camera) {
   theme.appendChild(customOpt);
   theme.value = "ivory"; // matches the engine defaults
 
-  const applyTheme = (id) => {
-    const t = findTheme(id);
-    if (!t) return;
-    engine.particleColor = t.particle.slice();
-    engine.occlusionColor = t.shadow.slice();
-    engine.backgroundColor = t.bg.slice();
-    $("pColor").value = rgb2hex(t.particle);
-    $("oColor").value = rgb2hex(t.shadow);
-    $("bgColor").value = rgb2hex(t.bg);
+  const palettePreview = $("palettePreview");
+  const paletteAccents = $("paletteAccents");
+  const updatePalettePreview = () => {
+    const stops = engine.paletteStops.length >= 2 ? engine.paletteStops : [
+      { position: 0, color: engine.occlusionColor },
+      { position: 1, color: engine.particleColor },
+    ];
+    const colors = stops.map((stop, i) => rgb2hex(i === 0 ? engine.occlusionColor
+      : i === stops.length - 1 ? engine.particleColor : stop.color));
+    palettePreview.style.background = `linear-gradient(to right, ${stops.map((stop, i) =>
+      `${colors[i]} ${stop.position * 100}%`).join(", ")})`;
+    palettePreview.setAttribute("aria-label", `Shadow to highlight: ${colors.join(", ")}`);
   };
+  const refreshPaletteControls = () => {
+    paletteAccents.replaceChildren();
+    paletteAccents.hidden = engine.paletteStops.length <= 2;
+    if (!paletteAccents.hidden) {
+      const label = document.createElement("span");
+      label.textContent = "Accents";
+      paletteAccents.appendChild(label);
+      engine.paletteStops.slice(1, -1).forEach((stop, i) => {
+        const input = document.createElement("input");
+        input.type = "color";
+        input.value = rgb2hex(stop.color);
+        input.title = `Accent ${i + 1} (${Math.round(stop.position * 100)}% light)`;
+        input.setAttribute("aria-label", `Palette accent ${i + 1}`);
+        input.addEventListener("input", (e) => {
+          stop.color = hex2rgb(e.target.value);
+          theme.value = "custom";
+          updatePalettePreview();
+        });
+        paletteAccents.appendChild(input);
+      });
+    }
+    updatePalettePreview();
+  };
+  const selectTheme = (id) => {
+    applyTheme(engine, id);
+    $("pColor").value = rgb2hex(engine.particleColor);
+    $("oColor").value = rgb2hex(engine.occlusionColor);
+    $("bgColor").value = rgb2hex(engine.backgroundColor);
+    refreshPaletteControls();
+  };
+  refreshPaletteControls();
   $("occMul").value = String(engine.occlusionMultiplier);
   $("occAtt").value = String(engine.occlusionAttenuation);
   const padVal = $("padVal");
@@ -192,15 +226,17 @@ export function buildUI(engine, blender, camera) {
     speedVal.textContent = blender.speed.toFixed(1);
   });
   theme.addEventListener("change", (e) => {
-    if (e.target.value !== "custom") applyTheme(e.target.value);
+    if (e.target.value !== "custom") selectTheme(e.target.value);
   });
   $("pColor").addEventListener("input", (e) => {
     engine.particleColor = hex2rgb(e.target.value);
     theme.value = "custom";
+    updatePalettePreview();
   });
   $("oColor").addEventListener("input", (e) => {
     engine.occlusionColor = hex2rgb(e.target.value);
     theme.value = "custom";
+    updatePalettePreview();
   });
   $("bgColor").addEventListener("input", (e) => {
     engine.backgroundColor = hex2rgb(e.target.value);
