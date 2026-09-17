@@ -4,6 +4,7 @@ import { Engine } from "./engine.js";
 import { Blender } from "./blender.js";
 import { OrbitCamera } from "./camera.js";
 import { buildUI } from "./ui.js";
+import { FrameRate } from "./performance.js";
 
 const canvas = document.getElementById("gpu");
 
@@ -15,6 +16,17 @@ function fail(message) {
 }
 
 const engine = new Engine(canvas);
+// Reproducible validation/profiling settings; ordinary visits keep the defaults.
+const params = new URLSearchParams(location.search);
+const particles = Number(params.get("particles"));
+if (Number.isSafeInteger(particles) && particles >= 64 && particles <= 100000000) {
+  engine.particlesPerBatch = particles;
+}
+const accum = Number(params.get("accum"));
+if (Number.isSafeInteger(accum) && accum >= 64 && accum <= 0x40000000) engine.accumTargetPoints = accum;
+const grid = Number(params.get("grid"));
+if ([16, 32, 64, 128].includes(grid)) engine.voxelGridDim = grid;
+engine.profilingEnabled = params.get("profile") === "1";
 
 try {
   await engine.init();
@@ -31,23 +43,18 @@ const ui = buildUI(engine, blender, camera);
 window.__app = { engine, blender, camera, ui };
 
 let last = performance.now();
-let acc = 0;
-let frames = 0;
+const frameRate = new FrameRate();
 
 function loop(now) {
-  const dt = Math.min((now - last) / 1000, 0.05);
+  const elapsed = (now - last) / 1000;
+  const dt = Math.min(elapsed, 0.05);
   last = now;
 
   blender.update(dt);
   engine.frame(blender, camera);
 
-  acc += dt;
-  frames++;
-  if (acc >= 0.5) {
-    ui.setFps(frames / acc);
-    acc = 0;
-    frames = 0;
-  }
+  const fps = frameRate.update(elapsed);
+  if (fps !== null) ui.setFps(fps);
 
   requestAnimationFrame(loop);
 }

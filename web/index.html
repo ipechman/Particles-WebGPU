@@ -60,6 +60,23 @@
         <select id="particles"></select>
       </label>
 
+      <label class="row" title="Fast reuses samples while the shape is still. Independent generates each refinement batch from scratch for comparison.">
+        <span>Refinement</span>
+        <select id="refinement">
+          <option value="reuse">Fast</option>
+          <option value="independent">Independent</option>
+        </select>
+      </label>
+
+      <label class="row" title="Full uses all particles for lighting. Lower settings reduce lighting work without reducing the rendered particle count; sparse shadows may change.">
+        <span>Lighting</span>
+        <select id="lighting">
+          <option value="full">Full</option>
+          <option value="2097152">Balanced</option>
+          <option value="524288">Fast</option>
+        </select>
+      </label>
+
       <label class="row" title="Preset color combinations.">
         <span>Theme</span>
         <select id="theme"></select>

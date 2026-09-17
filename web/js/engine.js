@@ -7,6 +7,8 @@
 import { mat4 } from "./math.js";
 import { MAX_TRANSFORMS } from "./blender.js";
 import { MAX_PALETTE_STOPS } from "./themes.js";
+import { PARTICLE_STRIDE, dispatchShape, lightingSchedule } from "./performance.js";
+import { GPUProfiler } from "./gpu-profiler.js";
 
 const WG = 64;                 // generic workgroup size
 const REDUCE_PARTIALS = 1024;  // stage-1 workgroups of the bounds reduction
@@ -34,6 +36,13 @@ export class Engine {
     this.voxelGridDim = 128;              // grid resolution
     this.voxelBounds = 3.0;               // world-space box size
     this.scalePadding = 0.5;              // flagship fit padding
+    this.lightingParticleBudget = Infinity; // Full lighting is the fidelity reference.
+    this.accumulationMode = "reuse";
+    this.accumulationHops = 4;
+    this.profilingEnabled = false;
+    this.sceneRevision = 0;
+    this.postStats = { kuwahara: 0, bloom: 0 };
+    this._nextBatchSeed = 1;
 
     this.particleColor = [0.93, 0.94, 0.96]; // neutral near-white highlight
     this.occlusionColor = [0.103773594, 0.014195448, 0.014195448];
@@ -66,12 +75,13 @@ export class Engine {
     // transforms (and the params they depend on) haven't changed since the last
     // computed frame. The render + post passes still run every frame.
     // Progressive accumulation: while the shape, camera and render params are
-    // all unchanged, independent chaos batches are baked into the hidden back
+    // all unchanged, additional chaos batches are baked into the hidden back
     // scene buffer (one per frame), multiplying effective detail. The batch
     // budget scales inversely with the particle count so the resting image
     // always converges toward ~accumTargetPoints effective points (lower
     // particle counts buffer longer: 8 batches at 8.4M, 256 at 262K). The
-    // front/back buffers swap at geometric checkpoints (4, 16, 64, 256
+    // Fast refinement advances existing chains; Independent restarts each batch.
+    // The front/back buffers swap at geometric checkpoints (4, 16, 64, 256
     // batches), each presenting a complete stable set. Once the budget is
     // reached the points pass is skipped entirely, so a fully idle frame
     // costs only the post chain.
@@ -104,20 +114,25 @@ export class Engine {
     // we can hold very large particle clouds (up to ~100M points) in one buffer.
     const lim = adapter.limits;
     this.device = await adapter.requestDevice({
+      requiredFeatures: this.profilingEnabled && adapter.features.has("timestamp-query")
+        ? ["timestamp-query"] : [],
       requiredLimits: {
         maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
         maxBufferSize: lim.maxBufferSize,
       },
     });
+    this.profiler = new GPUProfiler(this.device, { enabled: this.profilingEnabled });
     this.device.lost.then((info) => {
+      this.profiler.dispose();
       if (info.reason !== "destroyed") console.error("WebGPU device lost:", info.message);
     });
 
     this.maxComputeDim = this.device.limits.maxComputeWorkgroupsPerDimension;
-    // Largest particle count that fits a single 16-byte-per-point buffer.
+    // Packed f32 triplets retain precision while using 25% less storage.
     this.maxParticles = Math.floor(
-      Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize) / 16
+      Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize) / PARTICLE_STRIDE
     );
+    this.particlesPerBatch = Math.min(this.particlesPerBatch, this.maxParticles);
 
     this.ctx = this.canvas.getContext("webgpu");
     this.format = navigator.gpu.getPreferredCanvasFormat();
@@ -246,7 +261,7 @@ export class Engine {
   _createPipelines() {
     const d = this.device;
     const comp = (mod, entry, layout) =>
-      d.createComputePipeline({ layout, compute: { module: this.modules[mod], entryPoint: entry } });
+      d.createComputePipeline({ label: entry, layout, compute: { module: this.modules[mod], entryPoint: entry } });
 
     this.pipe = {
       iterate: comp("iterate", "iterate", this.pl.iter),
@@ -393,7 +408,8 @@ export class Engine {
 
     // Positions buffer.
     this.positionsBuf?.destroy();
-    this.positionsBuf = d.createBuffer({ size: this.particlesPerBatch * 16, usage: GPUBufferUsage.STORAGE, label: "positions" });
+    this.positionsBuf = d.createBuffer({ size: this.particlesPerBatch * PARTICLE_STRIDE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, label: "positions" });
 
     // Stage 1 of the bounds reduction reads the whole positions buffer.
     d.queue.writeBuffer(this.uReduce1, 0, new Uint32Array([this.particlesPerBatch, 0, 0, 0]));
@@ -595,7 +611,8 @@ export class Engine {
     // Pack the blended affine matrices and decide whether the attractor / voxel
     // / occlusion / fit results would actually differ from last frame.
     blender.packMatrices(this.transformData);
-    const recompute = this._computeStale(transformCount);
+    const recompute = this._computeStale(transformCount) ||
+      this._nextBatchSeed >= Math.floor(0x100000000 / this.particlesPerBatch);
 
     const s = this._schedule(transformCount);
 
@@ -608,6 +625,7 @@ export class Engine {
     if (recompute) {
       mode = "compute"; // rebuild attractor + grids, draw the front from scratch
       this._batchSeed = 0;
+      this._nextBatchSeed = 1;
       this._accumCount = 1;
       this._backBatches = 0;
       this._accumCheckpoint = Math.min(4, accumTarget);
@@ -618,15 +636,17 @@ export class Engine {
       this._accumCheckpoint = Math.min(4, accumTarget);
     } else if (this._accumCount < accumTarget) {
       mode = "accumulate"; // bake one more batch into the hidden back buffer
-      this._batchSeed = this._accumCount;
+      this._batchSeed = this._nextBatchSeed++;
     } else {
       mode = "idle"; // front holds the final accumulated image: post/present only
     }
 
-    this._writeUniforms(s, rb);
+    this.frameMode = mode;
+    this._writeUniforms(s, rb, mode);
     this._writePostUniforms();
 
     const enc = this.device.createCommandEncoder();
+    this.profiler.beginFrame();
     const front = this._front;
     const back = 1 - front;
     if (mode === "compute") {
@@ -640,10 +660,12 @@ export class Engine {
       this._dispatch(enc, this.pipe.combine, this.bgCombine, 1);
       this._encodeVoxelize(enc);
       this._encodeRender(enc, transformCount, true, front);
+      this.sceneRevision++;
     } else if (mode === "redraw") {
-      // The positions buffer holds whichever batch was baked last, so the
-      // next accumulation run may re-draw one batch. Harmless: same points.
+      // Keep the monotonically increasing sample counter when only the view
+      // changes, so independent refinement never replays the retained batch.
       this._encodeRender(enc, transformCount, true, front);
+      this.sceneRevision++;
     } else if (mode === "accumulate") {
       // Accumulation happens off-screen: the front image stays on display
       // untouched while batches bake into the back buffer, and the buffers
@@ -662,12 +684,15 @@ export class Engine {
       this._backBatches++;
       if (this._accumCount >= this._accumCheckpoint || this._accumCount >= accumTarget) {
         this._front = back; // checkpoint reached: present the denser image
+        this.sceneRevision++;
         this._backBatches = 0;
         this._accumCheckpoint = Math.min(this._accumCheckpoint * 4, accumTarget);
       }
     }
     this._encodePost(enc);
+    this.profiler.finishFrame(enc);
     this.device.queue.submit([enc.finish()]);
+    this.profiler.afterSubmit();
   }
 
   // Accumulation batch budget for the current particle count: enough batches
@@ -685,7 +710,11 @@ export class Engine {
       this._computeDirty ||
       !this._cachedTransformData ||
       transformCount !== this._cachedTransformCount ||
-      this.scalePadding !== this._cachedScalePadding;
+      this.scalePadding !== this._cachedScalePadding ||
+      this.voxelBounds !== this._cachedVoxelBounds ||
+      this.lightingParticleBudget !== this._cachedLightingBudget ||
+      this.accumulationMode !== this._cachedAccumulationMode ||
+      this.accumulationHops !== this._cachedAccumulationHops;
 
     if (!stale) {
       const a = this.transformData;
@@ -700,6 +729,10 @@ export class Engine {
       this._cachedTransformData.set(this.transformData);
       this._cachedTransformCount = transformCount;
       this._cachedScalePadding = this.scalePadding;
+      this._cachedVoxelBounds = this.voxelBounds;
+      this._cachedLightingBudget = this.lightingParticleBudget;
+      this._cachedAccumulationMode = this.accumulationMode;
+      this._cachedAccumulationHops = this.accumulationHops;
       this._computeDirty = false;
     }
     return stale;
@@ -760,16 +793,26 @@ export class Engine {
     return stale;
   }
 
-  _writeUniforms(s, rb) {
+  _writeUniforms(s, rb, mode) {
     const q = this.device.queue;
     const dim = this.voxelGridDim;
+    if (mode === "idle") return;
+    if (mode === "redraw") {
+      q.writeBuffer(this.uRender, 0, rb);
+      return;
+    }
 
     // uChaos: header + per-transform fixed-point seeds (exact attractor points).
-    new Uint32Array(this.uChaosCPU, 0, 5).set([
-      s.count, this.particlesPerBatch, this._dims(this.particlesPerBatch).width, s.iters, this._batchSeed | 0,
+    const advance = mode === "accumulate" && this.accumulationMode === "reuse";
+    new Uint32Array(this.uChaosCPU, 0, 6).set([
+      s.count, this.particlesPerBatch, this._dims(this.particlesPerBatch).width,
+      advance ? this.accumulationHops : s.iters, this._batchSeed, Number(advance),
     ]);
-    new Float32Array(this.uChaosCPU, 32).set(this._fixedPoints(s.count));
+    if (mode === "compute") {
+      new Float32Array(this.uChaosCPU, 32).set(this._fixedPoints(s.count));
+    }
     q.writeBuffer(this.uChaos, 0, this.uChaosCPU);
+    if (mode === "accumulate") return;
 
     // uCombine: transformCount
     q.writeBuffer(this.uCombine, 0, new Uint32Array([s.count, 0, 0, 0]));
@@ -789,7 +832,10 @@ export class Engine {
     const gridU = new ArrayBuffer(32);
     new Uint32Array(gridU, 0, 4).set([dim, s.count, this.particlesPerBatch, this.voxelCount]);
     new Float32Array(gridU, 16, 1).set([gridBounds]);
-    new Uint32Array(gridU, 20, 1).set([this._dims(this.particlesPerBatch).width]);
+    const lighting = lightingSchedule(this.particlesPerBatch, this.lightingParticleBudget);
+    new Uint32Array(gridU, 20, 3).set([
+      this._dims(lighting.count).width, lighting.count, lighting.stride,
+    ]);
     q.writeBuffer(this.uGrid, 0, gridU);
 
     // uRender (bytes prebuilt by _buildRenderUniform)
@@ -800,15 +846,16 @@ export class Engine {
   // dedicated pass so WebGPU's automatic inter-pass barriers guarantee that
   // reads observe the previous step's writes (read-after-write hazards).
   _dispatch(enc, pipeline, bindGroup, groups, dynamicOffsets) {
-    // `groups` is a workgroup count (1D) or [gx, gy] for a flattened 2D dispatch.
+    // `groups` is a count or [gx, gy, gz]; particle passes flatten 2D, AO uses 3D.
     const gx = Array.isArray(groups) ? groups[0] : groups;
     const gy = Array.isArray(groups) ? groups[1] : 1;
+    const gz = Array.isArray(groups) ? (groups[2] ?? 1) : 1;
     if (gx <= 0 || gy <= 0) return;
-    const p = enc.beginComputePass();
+    const p = enc.beginComputePass({ timestampWrites: this.profiler?.stamp(pipeline.label || "compute") });
     p.setPipeline(pipeline);
     if (dynamicOffsets) p.setBindGroup(0, bindGroup, dynamicOffsets);
     else p.setBindGroup(0, bindGroup);
-    p.dispatchWorkgroups(gx, gy);
+    p.dispatchWorkgroups(gx, gy, gz);
     p.end();
   }
 
@@ -816,10 +863,7 @@ export class Engine {
   // per-dimension workgroup limit. `width` is the number of threads the x
   // dimension spans, used by shaders to flatten (gid.y * width + gid.x).
   _dims(threadCount) {
-    const groups = Math.max(1, Math.ceil(threadCount / WG));
-    const x = Math.min(groups, this.maxComputeDim);
-    const y = Math.ceil(groups / x);
-    return { x, y, width: x * WG };
+    return dispatchShape(threadCount, WG, this.maxComputeDim);
   }
 
   // Measure the freshly iterated cloud (min/max/sum in two reduction stages)
@@ -864,10 +908,12 @@ export class Engine {
 
   _encodeVoxelize(enc) {
     const vGroups = Math.ceil(this.voxelCount / WG); // voxel grid stays within the 1D cap
-    const vd = this._dims(this.particlesPerBatch);
+    const vd = this._dims(lightingSchedule(this.particlesPerBatch, this.lightingParticleBudget).count);
     this._dispatch(enc, this.pipe.clearGrids, this.bgGrid, vGroups);
     this._dispatch(enc, this.pipe.voxelize, this.bgGrid, [vd.x, vd.y]);
-    this._dispatch(enc, this.pipe.occlusion, this.bgGrid, vGroups);
+    const dim = this.voxelGridDim;
+    this._dispatch(enc, this.pipe.occlusion, this.bgGrid,
+      [Math.ceil(dim / 8), Math.ceil(dim / 8), Math.ceil(dim / 4)]);
   }
 
   // Draw the point cloud into scene buffer `target`. With clear=false the
@@ -876,6 +922,7 @@ export class Engine {
   _encodeRender(enc, transformCount, clear, target) {
     const bg = this.backgroundColor;
     const p = enc.beginRenderPass({
+      timestampWrites: this.profiler?.stamp("particles"),
       colorAttachments: [{
         view: this.sceneViews[target],
         clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 },
@@ -897,8 +944,9 @@ export class Engine {
   }
 
   // Run one full-screen post pass into the given target view.
-  _fullscreen(enc, pipeline, bindGroup, targetView) {
+  _fullscreen(enc, pipeline, bindGroup, targetView, label = "post") {
     const p = enc.beginRenderPass({
+      timestampWrites: this.profiler?.stamp(label),
       colorAttachments: [{ view: targetView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
     });
     p.setPipeline(pipeline);
@@ -930,30 +978,39 @@ export class Engine {
     // Post always reads the FRONT scene buffer; accumulation renders into the
     // back one, so partially accumulated frames are never visible.
     const f = this._front;
+    const sceneKey = `${this.sceneRevision}:${this._fbW}:${this._fbH}`;
 
     // 1) Optional anisotropic Kuwahara filter (4 passes -> kuwaharaTex).
     const useKuwahara = this.kuwaharaEnabled;
-    if (useKuwahara) {
+    const kuwKey = JSON.stringify([sceneKey, this.kuwaharaKernelSize, this.kuwaharaSharpness,
+      this.kuwaharaAlpha, this.kuwaharaZeroCrossing, this.kuwaharaBlurRadius]);
+    if (useKuwahara && this._cachedKuwKey !== kuwKey) {
       this._fullscreen(enc, this.pipe.kuwStructure, this.bgKuwStructure[f], this.tensorAView); // scene -> tensorA
       this._fullscreen(enc, this.pipe.kuwBlurH, this.bgKuwBlurH, this.tensorBView);            // tensorA -> tensorB
       this._fullscreen(enc, this.pipe.kuwAniso, this.bgKuwAniso, this.tensorAView);            // tensorB -> tensorA (flow map)
       this._fullscreen(enc, this.pipe.kuwFilter, this.bgKuwFilter[f], this.kuwaharaView);      // scene + flow map -> kuwaharaTex
+      this._cachedKuwKey = kuwKey;
+      this.postStats.kuwahara++;
     }
     const bgPrefilter = useKuwahara ? this.bgPreFromKuw : this.bgPreFromScene[f];
     const bgPresent = useKuwahara ? this.bgPresentKuw : this.bgPresentScene[f];
 
     // 2) Optional bloom: bright-pass, then several separable blur iterations
     //    (each H+V pass widens and softens the glow).
-    if (this.bloomIntensity > 0.0001) {
+    const bloomKey = JSON.stringify([useKuwahara ? kuwKey : sceneKey, useKuwahara,
+      this.bloomThreshold, this.bloomSpread, this.bloomIterations]);
+    if (this.bloomIntensity > 0.0001 && this._cachedBloomKey !== bloomKey) {
       this._fullscreen(enc, this.pipe.prefilter, bgPrefilter, this.bloomAView); // -> bloomA
       for (let i = 0; i < this.bloomIterations; i++) {
         this._fullscreen(enc, this.pipe.blur, this.bgBlurH, this.bloomBView);   // A -> B (horizontal)
         this._fullscreen(enc, this.pipe.blur, this.bgBlurV, this.bloomAView);   // B -> A (vertical)
       }
+      this._cachedBloomKey = bloomKey;
+      this.postStats.bloom++;
     }
 
     // 3) Composite to the swap chain.
     const out = this.ctx.getCurrentTexture().createView();
-    this._fullscreen(enc, this.pipe.present, bgPresent, out);
+    this._fullscreen(enc, this.pipe.present, bgPresent, out, "present");
   }
 }
