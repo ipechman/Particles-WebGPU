@@ -130,7 +130,7 @@ try {
     // watchdog budget on a shared CI CPU. JS/GPU errors and suite timeouts
     // remain fatal; this does not disable WebGPU validation.
     args: [
-      "--enable-unsafe-webgpu", "--use-gl=angle", "--use-angle=vulkan",
+      "--enable-unsafe-webgpu", "--use-gl=angle", "--use-angle=swiftshader",
       "--use-vulkan=swiftshader", "--enable-features=Vulkan",
       "--disable-vulkan-surface", "--enable-unsafe-swiftshader", "--disable-gpu-watchdog",
     ],
