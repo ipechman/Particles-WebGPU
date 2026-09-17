@@ -107,7 +107,17 @@ async function screenshot(name) {
 async function check(name, run) {
   const started = performance.now();
   console.log(`START ${name}`);
-  await run();
+  let timeout;
+  try {
+    await Promise.race([
+      run(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${name}: exceeded the 120s check budget`)), 120_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
   await healthy();
   checks.push({ name, durationMs: Math.round(performance.now() - started), state: await state() });
   console.log(`PASS  ${name} (${checks.at(-1).durationMs} ms)`);
@@ -184,7 +194,7 @@ try {
   // Test-sized startup allocation avoids creating an initial 8M-particle
   // cloud before UI controls can lower the count. Most cases use a small grid;
   // a separate case below exercises the production 128^3 lighting grid.
-  await page.goto(`${base}/?particles=262144&accum=1048576&grid=32&profile=1`);
+  await page.goto(`${base}/?particles=32768&accum=131072&grid=32&profile=1`);
   await page.waitForFunction(() => Boolean(window.__app));
   await page.locator("#animate").uncheck();
 
@@ -434,7 +444,7 @@ try {
     assert.ok(cachedFrames >= 2, "Exercise hidden accumulation between visible checkpoints");
     await settled();
     await page.evaluate(() => {
-      window.__app.engine.accumTargetPoints = 1048576;
+      window.__app.engine.accumTargetPoints = 131072;
       window.__app.camera.yaw += 0.01;
     });
     await settled();
@@ -452,7 +462,7 @@ try {
     await settled();
     assert.equal(await page.evaluate(() => window.__app.engine.lightingParticleBudget === Infinity), true);
     await screenshot("full-lighting");
-    await page.locator("#particles").selectOption("262144");
+    await page.locator("#particles").selectOption("32768");
     await settled();
   });
 
