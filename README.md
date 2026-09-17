@@ -34,10 +34,12 @@ Needs a WebGPU-capable browser (recent Chrome / Edge / Chromium).
   fractal is sized inside the lighting box).
 - **Post-processing**: a toggle for the original **Kuwahara filter** (Acerola's
   edge-preserving painterly filter) and a **bloom** slider (0 disables it).
-- **Sampling — View focused** (default) directs particles toward visible fractal
-  branches in close-ups. Pause morphing, zoom and pan toward a structure, and
-  compare with **Global** at the same particle count. The status line shows when
-  focusing is active. Overview and heavily overlapping views retain Global.
+- **Sampling — Focus** (default) reallocates the existing particle and drawing
+  budget toward the current view. It works at the default camera and ordinary
+  centered zooms. The status below the control explicitly says **Focus active**,
+  **Preparing focus**, or explains why the shape is unsupported.
+- Pausing morphing freezes the current shape immediately. Resuming continues the
+  transition; **Randomize** while paused selects a new static shape immediately.
 - **Display — Detail** (default) adds small-scale depth shading and compresses
   bright highlights smoothly. **Exposure** controls its brightness. Bloom now
   starts at 0.25 instead of 2.2. **Classic** uses the original final composite;
@@ -72,10 +74,10 @@ Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
   remain still. **Independent** generates every batch at full depth for comparison.
   Shape changes restart sampling; moving the camera restarts image accumulation.
   Both modes refine toward the existing 67M base-sample target. These are samples,
-  not a guarantee of 67M distinct visible pixels. Global rendering multiplies the
-  count by the number of transforms; focused rendering draws each point once.
-  Focused batches use independent tails in both refinement modes, because advancing
-  a focused world-space point would move it out of its selected branch.
+  not a guarantee of 67M distinct visible pixels. Both Global and Focus draw
+  N × transformCount vertices per batch. Both retain the same base cloud, so Fast
+  refinement works in either sampling mode. Switching samplers with a one-batch
+  budget preserves the exact base samples as well as the fit and lighting.
 - **Lighting — Full** (default) retains all particles for voxel occupancy.
   **Balanced** caps lighting samples at about 2M and **Fast** at 524K, without
   lowering the number of rendered particles. Reduced lighting budgets may change
@@ -88,32 +90,39 @@ Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
 
 ### More detail per particle
 
-The view sampler builds a prefix-free hierarchy of affine IFS branches. It culls
-entire branches against the camera before sampling, then allocates the same N
-particles among visible leaves by projected footprint. A prefix is shared by a
-64-thread workgroup; each thread generates an attractor sample inside that branch.
-The hierarchy is bounded to 8,192 visited nodes, 1,024 leaves, and 24 levels, and
-rebuilds only when the view or geometry changes, after 80 ms without camera motion.
-Dragging redraws the existing cloud; stopping refreshes the focused samples.
-The uploaded table is at most
-80 KiB; the existing 12-byte particle buffer is reused.
+The view sampler builds a prefix-free hierarchy of affine IFS branches and culls
+branches outside the camera. It redistributes the same N × transformCount drawing
+budget among the remaining branches. The previous version drew only N focused
+points and silently disabled Focus in almost all normal views to compensate for
+that loss; this restriction has been removed.
 
-The original global batch still establishes the fit and lighting. A single
-64-byte asynchronous readback makes that fit available to the CPU hierarchy;
-camera movement never changes the fit or regenerates global lighting. Stale
-readbacks during morphing are discarded. Maps without a certified contractive
-bound, and views where culling cannot compensate for Global's instanced copies,
-keep the original sampling path. This is a conservative fallback, so some useful
-views may remain Global. Overlapping branch bounds can also spend particles on
-occluded surfaces.
+Conservative boxes alone do not capture overlapping procedural geometry. A bounded
+pilot of 32 attractor samples per leaf estimates screen density and nearby depth.
+This guides allocation while retaining a 15% natural-distribution component and
+at least one point per surviving branch. Pilot visibility never removes a branch.
+Each leaf samples all child maps, avoiding holes from fixing one child for a region.
+
+The hierarchy is bounded to 8,192 visited nodes, 1,024 leaves, and 24 levels. After
+80 ms without camera motion, its allocation updates. Focus keeps the original
+12-byte base-particle buffer; a draw table uses at most 82.5 KiB. At most 1,055 draw
+ranges keep every buffer index below N, including at 100M particles. Focus adds
+one affine transform per drawn point and more draw calls; this is a quality tradeoff,
+not a claim of faster rendering.
+
+The original global batch still establishes fit and voxel lighting. A bounded
+64-byte asynchronous readback exposes that fit to the hierarchy. Camera movement
+and sampler switching do not regenerate the base cloud or refit the shape. Focus
+is unavailable for maps without certified contractive bounds, and the UI reports
+that fallback explicitly. Pausing now stops interpolation immediately so focusing
+and accumulation can start on the selected shape.
 
 Detail display shades existing pixels using nearby valid depth samples, at the
 displayed scale rather than only the global 128³ lighting scale. Background pixels
 and missing depth samples do not create shading halos. The extra full-resolution
 RGBA16F target uses 8 bytes per pixel; the depth pass is cached at rest.
 
-Focusing changes the finite sample distribution, not the IFS geometry. It benefits
-close-ups, and does not promise a sharper whole-object silhouette at every angle.
+Focusing changes the finite sample distribution, not the IFS geometry. Views
+whose pixels are already saturated with particles can show smaller differences.
 Absolute float32 positions still limit extreme zoom; this change does not implement
 arbitrary-precision fractals or make hidden surfaces visible. At 100M particles the
 normal 67M accumulation target still gives one batch, but view focusing can now
@@ -147,12 +156,18 @@ The browser suite runs the real app in headed Chromium with software WebGPU
 (Xvfb supplies the display in CI). It checks
 WGSL compilation, GPU errors, nonblank rendering, presets/palettes, accumulation,
 camera controls, resizing, lighting, effects, cache invalidation, and profiling.
-View tests compare the GPU prefix sampler against an independent CPU point oracle,
-check depth shading on synthetic flat/stepped geometry, and render fixed close-ups
-at 32,768 particles against Global and a 32-batch dense reference. Geometry
-comparisons disable bloom and use constant color, so extra occupied pixels cannot
-come from glow. `view-quality.json` records coverage, reference agreement and CPU
-planning time; `detail-quality.json` records highlight clipping. These fixtures
+View tests invoke the production vertex-position function on the GPU and compare
+it with independent CPU coordinates, check immediate pause in all morph modes,
+and require Focus to activate in 30 ordinary centered CPU views. Browser quality
+tests use the visible Sampling control, normal mouse-wheel zoom, a 1280×720 viewport,
+and the standard 262K particle option on two classic and two frozen procedural
+forms. Both modes use identical base samples, fit, particle count, and N×M drawing
+budget. An eight-batch Global image supplies a denser geometry reference.
+
+Geometry comparisons use white points and disable bloom to exclude glow from the
+coverage metric; another pair uses a normal palette and Detail display.
+`normal-focus-quality.json` records the measured results and camera settings;
+`focus-coordinate-oracle.json` records the GPU coordinate errors. These fixtures
 measure image quality, not 100M-particle hardware FPS.
 Screenshots and a JSON report are written under `test-results/browser/` and
 uploaded by the regression workflow. Software-adapter timings are not hardware
@@ -212,7 +227,6 @@ web/
     ui.js               control panel wiring
   shaders/
     iterate.wgsl        attractor iteration
-    view-iterate.wgsl   generation inside visible address prefixes
     reduce.wgsl         parallel min/max/sum reduction
     fit.wgsl            auto-fit final transform
     voxelize.wgsl       voxel grid + ambient occlusion

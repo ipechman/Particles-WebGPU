@@ -10,6 +10,12 @@
   color-scheme: dark;
 }
 
+.sampling-status {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 0 7px;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
