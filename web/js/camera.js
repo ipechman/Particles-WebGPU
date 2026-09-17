@@ -28,12 +28,17 @@ export class OrbitCamera {
     return v3.add(this.target, v3.scale(dir, this.distance));
   }
 
-  viewProj(aspect) {
+  clipPlanes() {
     // Near/far track the orbit distance so depth precision is consistent at any
     // zoom level and you can keep zooming in without the near plane clipping
     // everything away.
     const near = Math.max(this.distance * 0.004, 1e-7);
     const far = this.distance * 60 + 50;
+    return { near, far };
+  }
+
+  viewProj(aspect) {
+    const { near, far } = this.clipPlanes();
     const view = mat4.lookAt(this.eye(), this.target, [0, 1, 0]);
     const proj = mat4.perspective(this.fov, aspect, near, far);
     return mat4.multiply(proj, view);

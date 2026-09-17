@@ -2,7 +2,7 @@
 // Final composite to the swap chain: base image + bloom * intensity.
 
 struct PresentParams {
-  p0: vec4<f32>, // .x = bloom intensity
+  p0: vec4<f32>, // bloom intensity, detail mode, exposure
   p1: vec4<f32>,
 };
 
@@ -34,6 +34,17 @@ fn vsFull(@builtin(vertex_index) vid: u32) -> VOut {
 fn fsPresent(i: VOut) -> @location(0) vec4<f32> {
   let base = textureSampleLevel(sceneTex, samp, i.uv, 0.0).rgb;
   let bloom = textureSampleLevel(bloomTex, samp, i.uv, 0.0).rgb;
-  let col = clamp(base + bloom * u.p0.x, vec3<f32>(0.0), vec3<f32>(1.0));
+  var col = max(base + bloom * u.p0.x, vec3<f32>(0.0));
+  if (u.p0.y > 0.5) {
+    col *= u.p0.z;
+    // Preserve hue and midtone contrast; roll off highlights continuously
+    // above 0.6 instead of clipping distinct colors to the same white.
+    let peak = max(max(col.r, col.g), col.b);
+    if (peak > 0.6) {
+      let compressed = 0.6 + 0.4 * (1.0 - exp(-(peak - 0.6) / 0.4));
+      col *= compressed / peak;
+    }
+  }
+  col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
   return vec4<f32>(col, 1.0);
 }

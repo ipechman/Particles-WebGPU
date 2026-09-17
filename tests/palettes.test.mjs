@@ -5,7 +5,8 @@ import { THEMES, MAX_PALETTE_STOPS, applyTheme, findTheme } from "../web/js/them
 
 const references = ["gilded-lagoon", "amber-fern", "glacial-ember"];
 const makeEngine = () => new Engine({ width: 640, height: 480 });
-const camera = { viewProj: () => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) };
+const camera = { viewProj: () => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+  clipPlanes: () => ({ near: 0.01, far: 100 }), fov: Math.PI / 3 };
 const uniform = (engine) => engine._buildRenderUniform({ count: 3 }, camera);
 
 test("reference ramps fit the GPU layout and cover the full lighting range", () => {

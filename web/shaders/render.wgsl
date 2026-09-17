@@ -16,7 +16,7 @@ struct Render {
   occlusionMultiplier: f32,
   occlusionAttenuation: f32,
   paletteStopCount: u32,
-  _p1: f32,
+  viewFocused: u32,
   _p2: f32,
   // .rgb = color, .w = AO position. Matches MAX_PALETTE_STOPS in themes.js.
   paletteStops: array<vec4<f32>, 6>,
@@ -28,6 +28,7 @@ struct Point { x: f32, y: f32, z: f32 };
 // combined[i] = finalTransform * transforms[i], premultiplied by combine.wgsl
 // so each of the ~25M instanced vertices applies a single matrix.
 @group(0) @binding(1) var<storage, read> combined: array<mat4x4<f32>>;
+@group(0) @binding(2) var<storage, read> finalTransform: array<mat4x4<f32>>;
 @group(0) @binding(3) var occlusionTex: texture_3d<f32>;
 @group(0) @binding(4) var<uniform> u: Render;
 @group(0) @binding(5) var occlusionSampler: sampler;
@@ -58,7 +59,10 @@ fn getTrilinearVoxel(pos: vec3<f32>) -> f32 {
 fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOut {
   let p = positions[vid];
   let basePos = vec3<f32>(p.x, p.y, p.z);
-  let world = combined[iid] * vec4<f32>(basePos, 1.0);
+  var world = combined[iid] * vec4<f32>(basePos, 1.0);
+  if (u.viewFocused != 0u) {
+    world = finalTransform[0] * vec4<f32>(basePos, 1.0);
+  }
 
   let halfBounds = u.gridBounds * 0.5;
   var oob = 0.0;
