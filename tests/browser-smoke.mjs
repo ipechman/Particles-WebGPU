@@ -47,6 +47,7 @@ await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const base = `http://127.0.0.1:${server.address().port}`;
 let browser;
 let page;
+let browserVersion;
 
 const state = () => page.evaluate(() => {
   const { engine, blender } = window.__app;
@@ -122,17 +123,24 @@ async function slider(id, value) {
 try {
   browser = await chromium.launch({
     headless: true,
-    args: ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
+    // Software shader compilation/execution can exceed Chromium's hardware
+    // watchdog budget on a shared CI CPU. JS/GPU errors and suite timeouts
+    // remain fatal; this does not disable WebGPU validation.
+    args: ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--disable-gpu-watchdog"],
   });
+  browserVersion = browser.version();
+  console.log(`Chromium ${browserVersion}`);
   page = await browser.newPage({ viewport: { width: 640, height: 480 }, deviceScaleFactor: 1 });
   page.setDefaultTimeout(90_000);
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("console", (message) => {
     messages.push({ type: message.type(), text: message.text() });
     if (message.type() === "error") errors.push(message.text());
+    if (message.text().startsWith("WebGPU adapter:")) console.log(message.text());
   });
   await page.addInitScript(() => {
     window.__gpuErrors = [];
+    window.__gpuStartup = { userAgent: navigator.userAgent, adapters: [] };
     window.addEventListener("unhandledrejection", (event) => {
       window.__gpuErrors.push(`Unhandled rejection: ${event.reason?.message || event.reason}`);
     });
@@ -141,11 +149,25 @@ try {
     if (typeof GPUAdapter !== "undefined") {
       const requestDevice = GPUAdapter.prototype.requestDevice;
       GPUAdapter.prototype.requestDevice = async function (...args) {
+        const info = this.info;
+        const adapter = {
+          vendor: info?.vendor, architecture: info?.architecture,
+          device: info?.device, description: info?.description,
+          fallback: this.isFallbackAdapter ?? info?.isFallbackAdapter,
+          features: [...this.features],
+          requiredFeatures: [...(args[0]?.requiredFeatures || [])],
+          requiredLimits: args[0]?.requiredLimits,
+          requestedAtMs: performance.now(),
+        };
+        window.__gpuStartup.adapters.push(adapter);
+        console.info(`WebGPU adapter: ${JSON.stringify(adapter)}`);
         const device = await requestDevice.apply(this, args);
+        adapter.createdAtMs = performance.now();
         device.addEventListener("uncapturederror", (event) => {
           window.__gpuErrors.push(event.error.message);
         });
         device.lost.then((info) => {
+          adapter.lost = { reason: info.reason, message: info.message, atMs: performance.now() };
           if (info.reason !== "destroyed") window.__gpuErrors.push(`Device lost: ${info.message}`);
         });
         return device;
@@ -494,10 +516,12 @@ try {
   process.exitCode = 1;
 } finally {
   let gpuErrors = [];
+  let startup;
   if (page) {
     try { gpuErrors = await page.evaluate(() => window.__gpuErrors); } catch { /* Page may have crashed. */ }
+    try { startup = await page.evaluate(() => window.__gpuStartup); } catch { /* Page may have crashed. */ }
   }
-  await writeFile(resolve(artifacts, "report.json"), JSON.stringify({ checks, errors, gpuErrors, messages }, null, 2));
+  await writeFile(resolve(artifacts, "report.json"), JSON.stringify({ browserVersion, startup, checks, errors, gpuErrors, messages }, null, 2));
   await browser?.close();
   await new Promise((done) => server.close(done));
 }

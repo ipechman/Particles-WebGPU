@@ -26,6 +26,8 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - name: Chromium software WebGPU smoke test
         run: npm run test:browser
+        env:
+          DEBUG: pw:browser
       - name: Upload browser evidence
         if: always()
         uses: actions/upload-artifact@v4
