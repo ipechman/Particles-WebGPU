@@ -88,6 +88,10 @@ async function renderDiagnostics() {
     const d = e.device, width = e._fbW, height = e._fbH, front = e._front;
     const rowBytes = Math.ceil(width * 8 / 256) * 256;
     const textureReadback = d.createBuffer({ size: rowBytes * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const presentRowBytes = Math.ceil(width * 4 / 256) * 256;
+    const presentTexture = d.createTexture({ size: [width, height], format: e.format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const presentReadback = d.createBuffer({ size: presentRowBytes * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const packed = d.createBuffer({ size: 176, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const metadata = d.createBuffer({ size: 320, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     try {
@@ -111,8 +115,10 @@ async function renderDiagnostics() {
       encoder.copyBufferToBuffer(packed, 0, metadata, 0, 176);
       encoder.copyBufferToBuffer(e.positionsBuf, 0, metadata, 176, 144);
       encoder.copyTextureToBuffer({ texture: e.sceneTexs[front] }, { buffer: textureReadback, bytesPerRow: rowBytes }, [width, height, 1]);
+      e._fullscreen(encoder, e.pipe.present, e.kuwaharaEnabled ? e.bgPresentKuw : e.bgPresentScene[front], presentTexture.createView());
+      encoder.copyTextureToBuffer({ texture: presentTexture }, { buffer: presentReadback, bytesPerRow: presentRowBytes }, [width, height, 1]);
       d.queue.submit([encoder.finish()]);
-      await Promise.all([textureReadback.mapAsync(GPUMapMode.READ), metadata.mapAsync(GPUMapMode.READ)]);
+      await Promise.all([textureReadback.mapAsync(GPUMapMode.READ), metadata.mapAsync(GPUMapMode.READ), presentReadback.mapAsync(GPUMapMode.READ)]);
       const half = (bits) => {
         const sign = bits & 0x8000 ? -1 : 1, exponent = (bits >>> 10) & 31, mantissa = bits & 1023;
         return exponent === 31 ? (mantissa ? NaN : sign * Infinity)
@@ -131,7 +137,16 @@ async function renderDiagnostics() {
         if (positive) positivePixels++;
       }
       const data = new Float32Array(metadata.getMappedRange());
+      const presented = new Uint8Array(presentReadback.getMappedRange());
+      let presentMaximum = 0, presentPositivePixels = 0;
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+        const i = y * presentRowBytes + x * 4;
+        const value = Math.max(presented[i], presented[i + 1], presented[i + 2]);
+        presentMaximum = Math.max(presentMaximum, value);
+        if (value > 25) presentPositivePixels++;
+      }
       return {
+        offscreenPresent: { maximum: presentMaximum, positivePixels: presentPositivePixels },
         scene: { width, height, front, revision: e.sceneRevision, minimum, maximum, positivePixels, nonfiniteChannels },
         finalTransform: Array.from(data.slice(0, 16)), combinedFirst: Array.from(data.slice(16, 32)),
         boundsWithPadding: Array.from(data.slice(32, 44)), firstPositions: Array.from(data.slice(44)),
@@ -141,7 +156,8 @@ async function renderDiagnostics() {
         gpuErrors: [...window.__gpuErrors],
       };
     } finally {
-      for (const buffer of [textureReadback, packed, metadata]) buffer.destroy();
+      for (const buffer of [textureReadback, packed, metadata, presentReadback]) buffer.destroy();
+      presentTexture.destroy();
     }
   });
 }
