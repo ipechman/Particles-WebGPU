@@ -12,6 +12,7 @@ import { PNG } from "pngjs";
 import { batchPoints, fixedPoint, fullDepth, qualityFixtures } from "./helpers/sampling.mjs";
 import { dispatchShape } from "../web/js/performance.js";
 import { runViewChecks } from "./helpers/browser-view-checks.mjs";
+import { runRefinementChecks } from "./helpers/browser-refinement-checks.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../web");
 const artifacts = resolve(root, "../test-results/browser");
@@ -24,6 +25,7 @@ const mimeTypes = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".wgsl": "text/plain; charset=utf-8",
+  ".svg": "image/svg+xml",
 };
 const server = createServer(async (req, res) => {
   try {
@@ -250,6 +252,9 @@ try {
     if (message.text().startsWith("WebGPU adapter:")) console.log(message.text());
   });
   await page.addInitScript(() => {
+    // Repeatable startup forms, while retaining the real default morph state.
+    let randomState = 12345;
+    Math.random = () => ((randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0) / 2 ** 32);
     window.__gpuErrors = [];
     window.__gpuStartup = { userAgent: navigator.userAgent, adapters: [] };
     window.addEventListener("unhandledrejection", (event) => {
@@ -290,10 +295,19 @@ try {
   // a separate case below exercises the production 128^3 lighting grid.
   await page.goto(`${base}/?particles=32768&accum=131072&grid=32&profile=1`);
   await page.waitForFunction(() => Boolean(window.__app));
-  await page.locator("#animate").uncheck();
-  // Stop the startup procedural transition before numerical readbacks. A CPU
-  // adapter otherwise accumulates hundreds of expensive morph frames in its
-  // queue while those asynchronous readbacks wait for earlier submissions.
+  await check("selecting Focus pauses startup morphing and activates the sampler", async () => {
+    assert.equal(await page.evaluate(() => window.__app.blender.animate), true);
+    assert.equal(await page.locator("#sampling").inputValue(), "global");
+    await page.locator("#sampling").selectOption("view");
+    const frozen = await page.evaluate(() => Array.from(window.__app.blender.packMatrices()));
+    await settled();
+    assert.equal(await page.locator("#animate").isChecked(), false);
+    assert.deepEqual(await page.evaluate(() => Array.from(window.__app.blender.packMatrices())), frozen);
+    assert.equal(await page.locator("#samplingStatus").textContent(), "Focus active");
+    await page.screenshot({ path: resolve(artifacts, "startup-focus-control.png") });
+    const icon = await page.request.get(`${base}/favicon.svg`);
+    assert.equal(icon.status(), 200); assert.match(icon.headers()["content-type"], /image\/svg/);
+  });
   await page.locator("#preset").selectOption("SierpinskiTriangle2D");
 
   await check("all WGSL modules compile", async () => {
@@ -428,6 +442,7 @@ try {
     assert.ok(geometry.max > geometry.min);
   });
 
+  await runRefinementChecks({ page, check, settled, screenshot, slider, artifacts });
   await page.locator("#preset").selectOption("SierpinskiTriangle3D");
   for (const theme of ["ivory", "ember", "gilded-lagoon", "amber-fern", "glacial-ember"]) {
     await check(`theme ${theme}`, async () => {

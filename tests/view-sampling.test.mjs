@@ -77,6 +77,7 @@ test("draw partitions cover exactly N*M with valid base indices, including 100M"
 
 test("fit readback is bounded and discards results from old geometry", async () => {
   const e = new Engine({}); let complete; let mapped = 0, unmapped = 0, copied = 0;
+  e.samplingMode = "view";
   const result = mat4.identity();
   e.fitReadback = { mapAsync: () => { mapped++; return new Promise(resolve => { complete = resolve; }); },
     getMappedRange: () => result.buffer, unmap: () => { unmapped++; } };

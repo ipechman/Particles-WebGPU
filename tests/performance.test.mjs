@@ -38,6 +38,23 @@ test("FPS uses wall time even below 20fps and ignores invalid intervals", () => 
   assert.equal(metric.update(1), 1);
 });
 
+test("explicit refinement works at 100M where Auto and both methods otherwise run one pass", () => {
+  const e = new Engine({});
+  assert.equal(e.samplingMode, "global", "Startup morphing must not claim Focus is running");
+  assert.equal(e._accumBatchTarget(), 8);
+  e.particlesPerBatch = 100000000;
+  for (const mode of ["reuse", "independent"]) {
+    e.accumulationMode = mode;
+    e.refinementPasses = "auto";
+    assert.equal(e._accumBatchTarget(), 1);
+    for (const passes of [1, 2, 4, 8]) {
+      e.refinementPasses = passes;
+      assert.equal(e._accumBatchTarget(), passes);
+      assert.equal(e.particlesPerBatch, 100000000, "More passes must not grow the particle buffer");
+    }
+  }
+});
+
 function postHarness() {
   const e = new Engine({});
   e.displayMode = "classic";
@@ -118,6 +135,41 @@ test("frame state resets on geometry changes and retains unique counters across 
   assert.equal(e.frameMode, "compute");
   e.transformData[0] = 2; e.frame(blender, {});
   assert.equal(e.frameMode, "compute");
+});
+
+test("changing the pass budget at 100M restarts image accumulation and runs the selected method", () => {
+  const e = new Engine({});
+  e.particlesPerBatch = 100000000; e.maxComputeDim = 65535;
+  e.transformData = new Float32Array(512); e.uChaosCPU = new ArrayBuffer(544);
+  e._front = 0; e._fbW = 640; e._fbH = 480;
+  e.sceneTexs = [{}, {}]; e.depthTexs = [{}, {}];
+  e.device = { queue: { writeBuffer() {}, submit() {} }, createCommandEncoder: () => ({ copyTextureToTexture() {}, finish() {} }) };
+  e.profiler = { beginFrame() {}, finishFrame() {}, afterSubmit() {} };
+  e.pipe = { combine: {} };
+  e._ensureSizes = e.resize = e._writePostUniforms = e._encodePost = e._encodeFit = e._encodeVoxelize = e._encodeRender = e._dispatch = () => {};
+  const iterations = [];
+  e._encodeIterate = () => iterations.push(Array.from(new Uint32Array(e.uChaosCPU, 0, 8)));
+  e._buildRenderUniform = () => new ArrayBuffer(224);
+  const blender = { getTransformCount: () => 3, packMatrices() {} };
+  // Execute the production frame scheduler and uniform writer without GPU
+  // allocation. This verifies 100M control semantics, not 100M GPU throughput.
+  e.frame(blender, {}); e.frame(blender, {});
+  assert.equal(e.frameMode, "idle"); assert.equal(e._accumCount, 1);
+  const revision = e._fitRevision;
+  e.refinementPasses = 4;
+  e.frame(blender, {});
+  assert.equal(e.frameMode, "redraw");
+  assert.equal(e._fitRevision, revision, "A budget edit must preserve the fit and lighting");
+  for (let i = 0; i < 4; i++) e.frame(blender, {});
+  assert.equal(e._accumCount, 4); assert.equal(e.frameMode, "idle");
+  assert.deepEqual(iterations.slice(1).map(u => [u[1], u[3], u[5]]), Array.from({ length: 3 }, () => [100000000, 4, 1]));
+  e.refinementPasses = 1; e.frame(blender, {});
+  assert.equal(e._accumCount, 1); assert.equal(e.frameMode, "redraw");
+  iterations.length = 0;
+  e.accumulationMode = "independent"; e.refinementPasses = 4;
+  for (let i = 0; i < 5; i++) e.frame(blender, {});
+  assert.equal(e._accumCount, 4); assert.equal(iterations.length, 4);
+  assert.ok(iterations.every(u => u[3] > 4 && u[5] === 0));
 });
 
 test("chaos and lighting uniforms match packed shader layouts, and only static reuse advances", () => {

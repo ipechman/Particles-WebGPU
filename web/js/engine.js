@@ -41,12 +41,15 @@ export class Engine {
     this.scalePadding = 0.5;              // flagship fit padding
     this.lightingParticleBudget = Infinity; // Full lighting is the fidelity reference.
     this.accumulationMode = "reuse";
+    this.refinementPasses = "auto";
     this.accumulationHops = 4;
     this.profilingEnabled = false;
     this.sceneRevision = 0;
     this.postStats = { kuwahara: 0, bloom: 0 };
     this._nextBatchSeed = 1;
-    this.samplingMode = "view";
+    // Startup morphing uses Global. Selecting Focus in the UI pauses the
+    // current shape so the selected sampler can actually take effect.
+    this.samplingMode = "global";
     this.displayMode = "detail";
     this.exposure = 1.0;
     this.detailStrength = 0.65;
@@ -672,6 +675,8 @@ export class Engine {
     new Uint32Array(rb, 120, 1)[0] = Number(this._viewActive);
     const renderStale = this._renderStale(rb);
     const accumTarget = this._accumBatchTarget();
+    const targetChanged = accumTarget !== this._cachedAccumTarget;
+    this._cachedAccumTarget = accumTarget;
     let mode;
     if (recompute) {
       mode = "compute"; // rebuild attractor + grids, draw the front from scratch
@@ -680,7 +685,7 @@ export class Engine {
       this._accumCount = 1;
       this._backBatches = 0;
       this._accumCheckpoint = Math.min(4, accumTarget);
-    } else if (viewChanged || renderStale) {
+    } else if (viewChanged || renderStale || targetChanged) {
       mode = "redraw";
       this._accumCount = 1;
       this._backBatches = 0;
@@ -818,6 +823,11 @@ export class Engine {
   // that the resting image converges toward ~accumTargetPoints effective
   // points (lower particle counts buffer longer), capped at 256.
   _accumBatchTarget() {
+    // Explicit passes also work above the automatic ~67M sample budget.
+    // They reuse the same particle buffer; only work and sample count grow.
+    if (Number.isSafeInteger(this.refinementPasses) && this.refinementPasses >= 1) {
+      return Math.min(256, this.refinementPasses);
+    }
     return Math.max(1, Math.min(256, Math.round(this.accumTargetPoints / this.particlesPerBatch)));
   }
 
