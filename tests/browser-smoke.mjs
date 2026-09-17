@@ -219,10 +219,10 @@ async function slider(id, value) {
 
 try {
   browser = await chromium.launch({
-    // Use the full browser and Vulkan compositor with a software Vulkan
-    // driver so WebGPU canvas textures can be shared with the compositor.
+    // Linux headless Chromium captures WebGPU canvases as black even when GPU
+    // readbacks are correct. Use a real compositor surface (Xvfb in CI).
     channel: "chromium",
-    headless: true,
+    headless: false,
     // Software shader compilation/execution can exceed Chromium's hardware
     // watchdog budget on a shared CI CPU. JS/GPU errors and suite timeouts
     // remain fatal; this does not disable WebGPU validation.

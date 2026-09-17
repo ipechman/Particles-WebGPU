@@ -95,10 +95,13 @@ npm ci
 npm test
 npx playwright install --with-deps chromium
 npm run test:browser
+# Linux without a desktop display:
+# xvfb-run -a npm run test:browser
 node tests/helpers/sampling.mjs --benchmark
 ```
 
-The browser suite runs the real app in Chromium with software WebGPU. It checks
+The browser suite runs the real app in headed Chromium with software WebGPU
+(Xvfb supplies the display in CI). It checks
 WGSL compilation, GPU errors, nonblank rendering, presets/palettes, accumulation,
 camera controls, resizing, lighting, effects, cache invalidation, and profiling.
 Screenshots and a JSON report are written under `test-results/browser/` and
