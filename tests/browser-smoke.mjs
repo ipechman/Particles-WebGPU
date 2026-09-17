@@ -578,6 +578,8 @@ try {
     const before = (await state()).revision;
     await page.waitForFunction((revision) => window.__app.engine.sceneRevision > revision + 3, before);
     assert.equal(await page.evaluate(() => window.__app.blender.animate), true);
+    assert.equal(await page.locator("#samplingStatus").textContent(), "Pause morphing to focus the current shape",
+      "Active morphing must explain why Focus is waiting for a stable shape");
     await page.locator("#animate").uncheck();
     const paused = await page.evaluate(() => Array.from(window.__app.blender.packMatrices()));
     await page.evaluate(async () => { for (let i = 0; i < 5; i++) await new Promise(requestAnimationFrame); });

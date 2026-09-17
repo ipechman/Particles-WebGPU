@@ -315,6 +315,7 @@ export function buildUI(engine, blender, camera) {
     updateStatus() {
       let message;
       if (engine.samplingMode === "global") message = "Global sampling selected";
+      else if (blender.animate && engine.frameMode === "compute") message = "Pause morphing to focus the current shape";
       else if (engine._fitReadbackFailed) message = "Focus unavailable: could not read the shape fit";
       else if (engine.viewStats.reason === "uncertified bounds") message = "Focus unavailable for this shape; using Global";
       else if (engine._viewPending || engine._fitPending) message = "Preparing focus…";
