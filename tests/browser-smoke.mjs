@@ -82,6 +82,70 @@ async function settled() {
   return current;
 }
 
+async function renderDiagnostics() {
+  return page.evaluate(async () => {
+    const { engine: e, camera } = window.__app;
+    const d = e.device, width = e._fbW, height = e._fbH, front = e._front;
+    const rowBytes = Math.ceil(width * 8 / 256) * 256;
+    const textureReadback = d.createBuffer({ size: rowBytes * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const packed = d.createBuffer({ size: 176, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const metadata = d.createBuffer({ size: 320, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      // Read-only bindings inspect buffers that intentionally lack COPY_SRC.
+      // The website's pipelines, resource usages, and uniforms stay untouched.
+      const module = d.createShaderModule({ code: `
+        @group(0) @binding(0) var<storage, read> fit: array<f32>;
+        @group(0) @binding(1) var<storage, read> combined: array<f32>;
+        @group(0) @binding(2) var<storage, read> bounds: array<f32>;
+        @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+        @compute @workgroup_size(1) fn copyMetadata() {
+          for (var i = 0u; i < 16u; i++) { output[i] = fit[i]; output[16u+i] = combined[i]; }
+          for (var i = 0u; i < 12u; i++) { output[32u+i] = bounds[i]; }
+        }` });
+      const pipeline = d.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "copyMetadata" } });
+      const bindGroup = d.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries:
+        [e.finalTransformBuf, e.combinedBuf, e.reduceResultBuf, packed].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+      const encoder = d.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(1); pass.end();
+      encoder.copyBufferToBuffer(packed, 0, metadata, 0, 176);
+      encoder.copyBufferToBuffer(e.positionsBuf, 0, metadata, 176, 144);
+      encoder.copyTextureToBuffer({ texture: e.sceneTexs[front] }, { buffer: textureReadback, bytesPerRow: rowBytes }, [width, height, 1]);
+      d.queue.submit([encoder.finish()]);
+      await Promise.all([textureReadback.mapAsync(GPUMapMode.READ), metadata.mapAsync(GPUMapMode.READ)]);
+      const half = (bits) => {
+        const sign = bits & 0x8000 ? -1 : 1, exponent = (bits >>> 10) & 31, mantissa = bits & 1023;
+        return exponent === 31 ? (mantissa ? NaN : sign * Infinity)
+          : sign * (exponent === 0 ? mantissa * 2 ** -24 : (1 + mantissa / 1024) * 2 ** (exponent - 15));
+      };
+      const texels = new Uint16Array(textureReadback.getMappedRange());
+      let minimum = Infinity, maximum = -Infinity, positivePixels = 0, nonfiniteChannels = 0;
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+        let positive = false;
+        for (let c = 0; c < 3; c++) {
+          const value = half(texels[y * rowBytes / 2 + x * 4 + c]);
+          if (!Number.isFinite(value)) { nonfiniteChannels++; continue; }
+          minimum = Math.min(minimum, value); maximum = Math.max(maximum, value);
+          positive ||= value > 0.001;
+        }
+        if (positive) positivePixels++;
+      }
+      const data = new Float32Array(metadata.getMappedRange());
+      return {
+        scene: { width, height, front, revision: e.sceneRevision, minimum, maximum, positivePixels, nonfiniteChannels },
+        finalTransform: Array.from(data.slice(0, 16)), combinedFirst: Array.from(data.slice(16, 32)),
+        boundsWithPadding: Array.from(data.slice(32, 44)), firstPositions: Array.from(data.slice(44)),
+        renderUniformF32: e._cachedRenderU ? Array.from(new Float32Array(e._cachedRenderU.buffer)) : null,
+        camera: { yaw: camera.yaw, pitch: camera.pitch, distance: camera.distance, target: [...camera.target] },
+        mode: e.frameMode, accumulation: e._accumCount, batchSeed: e._batchSeed,
+        gpuErrors: [...window.__gpuErrors],
+      };
+    } finally {
+      for (const buffer of [textureReadback, packed, metadata]) buffer.destroy();
+    }
+  });
+}
+
 async function screenshot(name) {
   // Hide only overlays in the screenshot. A visible control panel must not
   // cause the pixel test to pass when the actual WebGPU image is blank.
@@ -98,6 +162,13 @@ async function screenshot(name) {
     if (value > 25) bright++;
     darkest = Math.min(darkest, value);
     brightest = Math.max(brightest, value);
+  }
+  if (bright <= width * height * 0.001 || brightest - darkest <= 25) {
+    let diagnostics;
+    try { diagnostics = await renderDiagnostics(); }
+    catch (error) { diagnostics = { diagnosticError: error.stack || String(error) }; }
+    await writeFile(resolve(artifacts, `${name}-render-diagnostics.json`), JSON.stringify(diagnostics, null, 2));
+    console.log(`Render diagnostics ${name}: ${JSON.stringify(diagnostics)}`);
   }
   assert.ok(bright > width * height * 0.001, `${name}: fractal image is blank (${bright} bright pixels)`);
   assert.ok(brightest - darkest > 25, `${name}: image is uniform`);
@@ -197,6 +268,10 @@ try {
   await page.goto(`${base}/?particles=32768&accum=131072&grid=32&profile=1`);
   await page.waitForFunction(() => Boolean(window.__app));
   await page.locator("#animate").uncheck();
+  // Stop the startup procedural transition before numerical readbacks. A CPU
+  // adapter otherwise accumulates hundreds of expensive morph frames in its
+  // queue while those asynchronous readbacks wait for earlier submissions.
+  await page.locator("#preset").selectOption("SierpinskiTriangle2D");
 
   await check("all WGSL modules compile", async () => {
     const compilation = await page.evaluate(async () => {
