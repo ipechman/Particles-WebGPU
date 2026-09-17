@@ -87,7 +87,9 @@ export async function runViewChecks({ page, check, settled, screenshot, slider, 
     assert.deepEqual(await page.evaluate(() => Array.from(window.__app.engine._fitCPU)), refit);
     await screenshot("focused-resize");
     await page.setViewportSize({ width: 640, height: 480 }); await settled();
-    await page.evaluate(() => { window.__app.camera.target = [100, 100, 100]; });
+    // Place the shape beyond this ordinary zoom's far plane. The previous
+    // 100-unit offset could still intersect the view at distance 1.9.
+    await page.evaluate(() => { window.__app.camera.target = [1000, 1000, 1000]; });
     await settled();
     assert.equal(await page.evaluate(() => window.__app.engine._viewPlan.leaves.length), 0);
     await page.evaluate(() => { const c = window.__app.camera; c.target = [0, 0, 0]; c.distance = 4.5; });
