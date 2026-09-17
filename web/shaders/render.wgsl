@@ -28,10 +28,12 @@ struct Point { x: f32, y: f32, z: f32 };
 // combined[i] = finalTransform * transforms[i], premultiplied by combine.wgsl
 // so each of the ~25M instanced vertices applies a single matrix.
 @group(0) @binding(1) var<storage, read> combined: array<mat4x4<f32>>;
-@group(0) @binding(2) var<storage, read> finalTransform: array<mat4x4<f32>>;
 @group(0) @binding(3) var occlusionTex: texture_3d<f32>;
 @group(0) @binding(4) var<uniform> u: Render;
 @group(0) @binding(5) var occlusionSampler: sampler;
+struct ViewDraw { matrix: mat4x4<f32>, copy: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(6) var<storage, read> viewDraws: array<ViewDraw>;
+@group(0) @binding(7) var<storage, read> transforms: array<mat4x4<f32>>;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -55,14 +57,23 @@ fn getTrilinearVoxel(pos: vec3<f32>) -> f32 {
   return v;
 }
 
+fn worldPoint(vid: u32, iid: u32) -> vec4<f32> {
+  let p = positions[vid];
+  let base = vec4<f32>(p.x, p.y, p.z, 1.0);
+  if (u.viewFocused != 0u) {
+    let draw = viewDraws[iid];
+    // Every leaf samples all child maps. Holding the child map constant for
+    // a leaf would leave most of that branch empty. Repeated base indices in
+    // different copies use distinct children, preserving the full N*M budget.
+    let child = (vid + draw.copy) % u.transformCount;
+    return draw.matrix * (transforms[child] * base);
+  }
+  return combined[iid] * base;
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOut {
-  let p = positions[vid];
-  let basePos = vec3<f32>(p.x, p.y, p.z);
-  var world = combined[iid] * vec4<f32>(basePos, 1.0);
-  if (u.viewFocused != 0u) {
-    world = finalTransform[0] * vec4<f32>(basePos, 1.0);
-  }
+  let world = worldPoint(vid, iid);
 
   let halfBounds = u.gridBounds * 0.5;
   var oob = 0.0;

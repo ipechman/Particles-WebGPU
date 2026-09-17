@@ -152,6 +152,11 @@ export class Blender {
   // Regenerate the target set (equivalent to pressing 'f' / set2.ApplyPreset()).
   randomizeTarget() {
     this.set2 = buildPreset(this.preset, this.proceduralCount);
+    if (!this.animate) {
+      // A paused Randomize selects a new static form immediately.
+      this.moveTowardSet = this.set2.map(cloneInstr);
+      this.blendedSet = this.moveTowardSet;
+    }
     this.ramp = 0;
     // Start a fresh eased transition from the current form (spring keeps its
     // momentum, so its velocity is intentionally left untouched).
@@ -246,6 +251,9 @@ export class Blender {
 
   // Advance the simulation by dt seconds and return the freshly blended set.
   update(dt) {
+    // Pause the current shape immediately, including interpolation, timers,
+    // and spring velocity. This also lets fit/lighting/refinement settle.
+    if (!this.animate) return this.blendedSet;
     // Ramp timer for lerp smoothing + smoothstep transition progress.
     this.ramp += dt * this.rampSpeed;
     this.morphProgress = Math.min(1, this.morphProgress + dt * this.speed);

@@ -68,13 +68,14 @@
         </select>
       </label>
 
-      <label class="row" title="View focused spends particles on visible branches in close-ups once the shape settles. Global keeps the original distribution. Overview and unsupported shapes use Global automatically.">
+      <label class="row" title="Focus redistributes the same particle and drawing budget toward the current view. Pause morphing to inspect a steady shape. Global keeps the original distribution.">
         <span>Sampling</span>
         <select id="sampling">
-          <option value="view">View focused</option>
+          <option value="view">Focus</option>
           <option value="global">Global</option>
         </select>
       </label>
+      <div id="samplingStatus" class="sampling-status" role="status" aria-live="polite"></div>
 
       <label class="row" title="Detail adds small-scale depth shading and preserves bright color differences. Classic uses the original final composite.">
         <span>Display</span>

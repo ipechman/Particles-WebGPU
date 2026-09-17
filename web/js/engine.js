@@ -9,7 +9,7 @@ import { MAX_TRANSFORMS } from "./blender.js";
 import { MAX_PALETTE_STOPS } from "./themes.js";
 import { PARTICLE_STRIDE, dispatchShape, lightingSchedule } from "./performance.js";
 import { GPUProfiler } from "./gpu-profiler.js";
-import { attractorBounds, buildViewPlan, multiply64, packViewLeaves,
+import { attractorBounds, buildViewPlan, multiply64, viewWeights, packViewDraws,
   MAX_VIEW_LEAVES, VIEW_LEAF_BYTES } from "./view-sampling.js";
 
 const WG = 64;                 // generic workgroup size
@@ -19,7 +19,6 @@ const RENDER_UNIFORM_SIZE = 128 + MAX_PALETTE_STOPS * 16;
 
 const SHADER_FILES = {
   iterate: "shaders/iterate.wgsl",
-  viewIterate: "shaders/view-iterate.wgsl",
   detail: "shaders/detail.wgsl",
   reduce: "shaders/reduce.wgsl",
   fit: "shaders/fit.wgsl",
@@ -190,10 +189,6 @@ export class Engine {
           buf(2, C, "uniform"),
         ],
       }),
-      viewIter: d.createBindGroupLayout({ entries: [
-        buf(0, C, "storage"), buf(1, C, "read-only-storage"),
-        buf(2, C, "uniform"), buf(3, C, "read-only-storage"),
-      ] }),
       detail: d.createBindGroupLayout({ entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
@@ -236,6 +231,8 @@ export class Engine {
           { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
           buf(4, VF, "uniform"),
           { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+          buf(6, GPUShaderStage.VERTEX, "read-only-storage"),
+          buf(7, GPUShaderStage.VERTEX, "read-only-storage"),
         ],
       }),
       // Post passes: sampler + input texture + params.
@@ -267,7 +264,6 @@ export class Engine {
 
     this.pl = {
       iter: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.iter] }),
-      viewIter: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.viewIter] }),
       detail: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.detail] }),
       reduce: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.reduce] }),
       fit: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.fit] }),
@@ -287,7 +283,6 @@ export class Engine {
 
     this.pipe = {
       iterate: comp("iterate", "iterate", this.pl.iter),
-      iterateView: comp("viewIterate", "iterateView", this.pl.viewIter),
       reducePoints: comp("reduce", "reducePoints", this.pl.reduce),
       reduceBounds: comp("reduce", "reduceBounds", this.pl.reduce),
       fit: comp("fit", "fit", this.pl.fit),
@@ -358,7 +353,7 @@ export class Engine {
     this.transformsBuf = d.createBuffer({ size: MAX_TRANSFORMS * 64, usage: S, label: "transforms" });
     this.finalTransformBuf = d.createBuffer({ size: 64, usage: S | GPUBufferUsage.COPY_SRC, label: "finalTransform" });
     this.fitReadback = d.createBuffer({ size: 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, label: "fitReadback" });
-    this.viewLeavesBuf = d.createBuffer({ size: MAX_VIEW_LEAVES * VIEW_LEAF_BYTES, usage: S, label: "viewLeaves" });
+    this.viewLeavesBuf = d.createBuffer({ size: (MAX_VIEW_LEAVES + MAX_TRANSFORMS) * VIEW_LEAF_BYTES, usage: S, label: "viewDraws" });
     this.reduceResultBuf = d.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE, label: "reduceResult" });
     // combined[i] = finalTransform * transforms[i], premultiplied on the GPU
     // after the fit pass (combine.wgsl) so render/voxelize apply one matrix.
@@ -472,12 +467,6 @@ export class Engine {
         { binding: 2, resource: { buffer: this.uChaos } },
       ],
     });
-    this.bgViewIter = d.createBindGroup({ layout: this.bgl.viewIter, entries: [
-      { binding: 0, resource: { buffer: this.positionsBuf } },
-      { binding: 1, resource: { buffer: this.transformsBuf } },
-      { binding: 2, resource: { buffer: this.uChaos } },
-      { binding: 3, resource: { buffer: this.viewLeavesBuf } },
-    ] });
 
     // Stage 1 of the bounds reduction: positions -> per-workgroup partials.
     // Binding 3 is unused by the reducePoints entry, but it must not alias
@@ -514,6 +503,8 @@ export class Engine {
         { binding: 3, resource: this.occlusionView },
         { binding: 4, resource: { buffer: this.uRender } },
         { binding: 5, resource: this.sampler },
+        { binding: 6, resource: { buffer: this.viewLeavesBuf } },
+        { binding: 7, resource: { buffer: this.transformsBuf } },
       ],
     });
 
@@ -677,7 +668,7 @@ export class Engine {
     // Classify the frame. The render-state check must run every frame so its
     // cache tracks what is actually on screen.
     const rb = this._buildRenderUniform(s, camera);
-    const resample = this._updateViewPlan(rb, s.count);
+    const viewChanged = this._updateViewPlan(rb, s.count);
     new Uint32Array(rb, 120, 1)[0] = Number(this._viewActive);
     const renderStale = this._renderStale(rb);
     const accumTarget = this._accumBatchTarget();
@@ -689,9 +680,8 @@ export class Engine {
       this._accumCount = 1;
       this._backBatches = 0;
       this._accumCheckpoint = Math.min(4, accumTarget);
-    } else if (resample || renderStale) {
-      mode = resample ? "resample" : "redraw";
-      if (resample) this._batchSeed = this._nextBatchSeed++;
+    } else if (viewChanged || renderStale) {
+      mode = "redraw";
       this._accumCount = 1;
       this._backBatches = 0;
       this._accumCheckpoint = Math.min(4, accumTarget);
@@ -725,12 +715,6 @@ export class Engine {
     } else if (mode === "redraw") {
       // Keep the monotonically increasing sample counter when only the view
       // changes, so independent refinement never replays the retained batch.
-      this._encodeRender(enc, transformCount, true, front);
-      this.sceneRevision++;
-    } else if (mode === "resample") {
-      // The fit and global lighting stay camera-independent. Only replace the
-      // samples when the visible address frontier changes.
-      this._encodeIterate(enc);
       this._encodeRender(enc, transformCount, true, front);
       this.sceneRevision++;
     } else if (mode === "accumulate") {
@@ -778,32 +762,35 @@ export class Engine {
     }
     const vp = new Float32Array(rb, 0, 16);
     const key = `${this._fitRevision}:${this.particlesPerBatch}:${this._fbW}:${this._fbH}:${Array.from(vp)}`;
-    if (key === this._viewKey) { this._viewPending = false; return false; }
+    if (key === this._viewKey) { this._viewPending = false; this._viewRequestedKey = key; return false; }
     if (key !== this._viewRequestedKey) {
       this._viewRequestedKey = key;
       this._viewChangedAt = performance.now();
     }
-    // Keep camera interaction on the cheap redraw path. Generate a new cloud
-    // after the view has been still briefly, not on every pointer event.
+    // Reallocate the drawing budget after the view has been still briefly.
+    // Both samplers retain the same base cloud, fit, and lighting.
     this._viewPending = performance.now() - this._viewChangedAt < 80;
     if (this._viewPending) return false;
     this._viewKey = key;
     const start = performance.now();
     const matrices = Array.from({ length: count }, (_, i) => this.transformData.slice(i * 16, i * 16 + 16));
-    if (this._viewBounds === undefined) {
-      const packedSeeds = this._fixedPoints(count);
-      const seeds = matrices.map((_, i) => packedSeeds.slice(i * 4, i * 4 + 3));
-      this._viewBounds = attractorBounds(matrices, seeds);
-    }
+    const packedSeeds = this._fixedPoints(count);
+    const seeds = matrices.map((_, i) => packedSeeds.slice(i * 4, i * 4 + 3));
+    if (this._viewBounds === undefined) this._viewBounds = attractorBounds(matrices, seeds);
+    const viewFit = multiply64(vp, this._fitCPU);
     const plan = buildViewPlan({ matrices, bounds: this._viewBounds,
-      viewFit: multiply64(vp, this._fitCPU), width: this._fbW, height: this._fbH,
-      particles: this.particlesPerBatch });
+      viewFit, width: this._fbW, height: this._fbH,
+      particles: this.particlesPerBatch * count });
     this._viewPlan = plan;
     this._viewActive = plan.active;
-    if (plan.active && plan.leaves.length) {
-      this.device.queue.writeBuffer(this.viewLeavesBuf, 0, packViewLeaves(plan.leaves, this.particlesPerBatch));
+    if (plan.active) {
+      const weights = viewWeights(plan.leaves, { matrices, seeds, viewFit, width: this._fbW, height: this._fbH });
+      const packed = packViewDraws(plan.leaves, this.particlesPerBatch, count, this._fitCPU, weights);
+      this._viewDraws = packed.draws;
+      this.device.queue.writeBuffer(this.viewLeavesBuf, 0, packed.bytes);
     }
     this.viewStats = { active: plan.active, reason: plan.reason, leaves: plan.leaves.length,
+      vertices: plan.active ? this._viewDraws.reduce((sum, draw) => sum + draw.count, 0) : this.particlesPerBatch * count,
       visibleMass: plan.visibleMass, visited: plan.visited, planningMs: performance.now() - start };
     return previous || plan.active;
   }
@@ -937,21 +924,17 @@ export class Engine {
     }
 
     // uChaos: header + per-transform fixed-point seeds (exact attractor points).
-    const advance = mode === "accumulate" && this.accumulationMode === "reuse" && !this._viewActive;
+    const advance = mode === "accumulate" && this.accumulationMode === "reuse";
     new Uint32Array(this.uChaosCPU, 0, 8).set([
       s.count, this.particlesPerBatch, this._dims(this.particlesPerBatch).width,
       advance ? this.accumulationHops : s.iters, this._batchSeed, Number(advance),
-      this._viewActive ? this._viewPlan.leaves.length : 0, 0,
+      0, 0,
     ]);
     if (mode === "compute") {
       new Float32Array(this.uChaosCPU, 32).set(this._fixedPoints(s.count));
     }
     q.writeBuffer(this.uChaos, 0, this.uChaosCPU);
     if (mode === "accumulate") return;
-    if (mode === "resample") {
-      q.writeBuffer(this.uRender, 0, rb);
-      return;
-    }
 
     // uCombine: transformCount
     q.writeBuffer(this.uCombine, 0, new Uint32Array([s.count, 0, 0, 0]));
@@ -1041,10 +1024,8 @@ export class Engine {
   }
 
   _encodeIterate(enc) {
-    if (this._viewActive && !this._viewPlan.leaves.length) return;
     const d = this._dims(this.particlesPerBatch);
-    this._dispatch(enc, this._viewActive ? this.pipe.iterateView : this.pipe.iterate,
-      this._viewActive ? this.bgViewIter : this.bgIter, [d.x, d.y]);
+    this._dispatch(enc, this.pipe.iterate, this.bgIter, [d.x, d.y]);
   }
 
   _encodeVoxelize(enc) {
@@ -1080,8 +1061,14 @@ export class Engine {
     p.setPipeline(this.pipe.render);
     p.setBindGroup(0, this.bgRender);
     // vertexCount = particlesPerBatch, instanceCount = transformCount
-    p.draw(this._viewActive && !this._viewPlan.leaves.length ? 0 : this.particlesPerBatch,
-      this._viewActive ? 1 : transformCount);
+    if (this._viewActive) {
+      for (let i = 0; i < this._viewDraws.length; i++) {
+        const draw = this._viewDraws[i];
+        p.draw(draw.count, 1, draw.first, i);
+      }
+    } else {
+      p.draw(this.particlesPerBatch, transformCount);
+    }
     p.end();
   }
 

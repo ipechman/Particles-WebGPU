@@ -86,7 +86,7 @@ export const qualityFixtures = [
   ["vicsek-3d", Vicsek3D()],
   ["procedural-3", frozenProcedural(3, 31047)],
   ["procedural-8", frozenProcedural(8, 89213)],
-].map(([name, instructions]) => ({ name, matrices: instructions.map(affineFromInstr) }));
+].map(([name, instructions]) => ({ name, instructions, matrices: instructions.map(affineFromInstr) }));
 
 function project(x, y, z) {
   // Orthographic view: fixed 0.55-radian yaw, 0.3-radian pitch.

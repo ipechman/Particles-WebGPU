@@ -52,6 +52,7 @@ function loop(now) {
 
   blender.update(dt);
   engine.frame(blender, camera);
+  ui.updateStatus();
 
   const fps = frameRate.update(elapsed);
   if (fps !== null) ui.setFps(fps);

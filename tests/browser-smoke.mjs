@@ -305,7 +305,7 @@ try {
       return Object.fromEntries(entries);
     });
     await writeFile(resolve(artifacts, "shader-compilation.json"), JSON.stringify(compilation, null, 2));
-    assert.ok(Object.keys(compilation).length >= 11);
+    assert.ok(Object.keys(compilation).length >= 10);
     for (const [name, diagnostics] of Object.entries(compilation)) {
       assert.deepEqual(diagnostics.filter((d) => d.type === "error"), [], `${name} WGSL errors`);
     }
@@ -578,11 +578,13 @@ try {
     const before = (await state()).revision;
     await page.waitForFunction((revision) => window.__app.engine.sceneRevision > revision + 3, before);
     assert.equal(await page.evaluate(() => window.__app.blender.animate), true);
+    assert.equal(await page.locator("#samplingStatus").textContent(), "Pause morphing to focus the current shape",
+      "Active morphing must explain why Focus is waiting for a stable shape");
     await page.locator("#animate").uncheck();
-    // Pausing stops new targets; the current morph still finishes normally.
-    // Raise the existing speed control so this correctness test need not wait
-    // several seconds for the asymptotic animation to settle on a CPU adapter.
-    await slider("speed", 6);
+    const paused = await page.evaluate(() => Array.from(window.__app.blender.packMatrices()));
+    await page.evaluate(async () => { for (let i = 0; i < 5; i++) await new Promise(requestAnimationFrame); });
+    assert.deepEqual(await page.evaluate(() => Array.from(window.__app.blender.packMatrices())), paused,
+      "Unchecking Morph must freeze the current shape immediately");
     await settled();
     await screenshot("procedural-paused");
   });

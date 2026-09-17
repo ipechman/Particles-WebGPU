@@ -139,27 +139,85 @@ export function buildViewPlan({ matrices, bounds, viewFit, width, height, partic
   }
   const leaves = done.concat(heap.items);
   const visibleMass = leaves.reduce((sum, leaf) => sum + leaf.mass, 0);
-  // The global renderer submits N * transformCount points. Switch only when
-  // culling can recover that multiplicity and give a useful sampling gain.
-  const active = visibleMass * matrices.length < 0.7;
-  return { active, reason: active ? "focused" : "overview", leaves, visited, visibleMass };
+  // The focused renderer now keeps Global's full N * transformCount drawing
+  // budget. Selecting Focus must not silently turn it off at ordinary zooms.
+  return { active: true, reason: "focused", leaves, visited, visibleMass };
 }
 
-export function packViewLeaves(leaves, particles) {
-  const bytes = new ArrayBuffer(Math.max(1, leaves.length) * VIEW_LEAF_BYTES);
-  const groups = Math.ceil(particles / 64);
-  if (!leaves.length) return bytes;
-  // One workgroup minimum per leaf preserves thin branches; the remainder is
-  // distributed by projected footprint, not the original branch probability.
-  const weights = leaves.map(leaf => Math.sqrt(leaf.area));
-  const total = weights.reduce((sum, v) => sum + v, 0);
-  const spare = groups - leaves.length;
-  let cumulative = 0, end = 0;
-  leaves.forEach((leaf, i) => {
-    new Float32Array(bytes, i * VIEW_LEAF_BYTES, 16).set(leaf.matrix);
-    cumulative += weights[i];
-    end = i === leaves.length - 1 ? groups : i + 1 + Math.floor(spare * cumulative / total);
-    new Uint32Array(bytes, i * VIEW_LEAF_BYTES + 64, 4).set([end, 0, 0, 0]);
+function pcg(value) {
+  const state = (Math.imul(value, 747796405) + 2891336453) >>> 0;
+  const word = Math.imul((state >>> ((state >>> 28) + 4)) ^ state, 277803737) >>> 0;
+  return ((word >>> 22) ^ word) >>> 0;
+}
+
+// Conservative boxes alone cannot describe overlapping procedural shapes.
+// A small, deterministic pilot estimates where their samples actually land.
+// This changes allocation only: a branch is never culled by pilot visibility.
+export function viewWeights(leaves, { matrices, seeds, viewFit, width, height }) {
+  if (!leaves.length) return [];
+  const pool = [];
+  for (let i = 0; i < 1024; i++) {
+    let h = pcg(i + 7919), p = Array.from(seeds[h % matrices.length]);
+    for (let k = 0; k < 32; k++) {
+      h = pcg(h);
+      const m = matrices[h % matrices.length];
+      p = [0, 1, 2].map(r => point(m, p, r));
+    }
+    pool.push(p);
+  }
+  const nx = Math.min(128, Math.ceil(width / 8));
+  const ny = Math.min(128, Math.ceil(height / 8));
+  const density = new Float64Array(nx * ny);
+  const nearest = new Float64Array(nx * ny).fill(Infinity);
+  const probes = leaves.map((leaf, leafIndex) => {
+    const matrix = multiply64(viewFit, leaf.matrix), visible = [];
+    for (let j = 0; j < 32; j++) {
+      const p = pool[(leafIndex * 37 + j * 17) % pool.length];
+      const x = point(matrix, p, 0), y = point(matrix, p, 1);
+      const z = point(matrix, p, 2), w = point(matrix, p, 3);
+      if (w <= 0 || x < -w || x >= w || y <= -w || y > w || z < 0 || z >= w) continue;
+      const tile = Math.floor((0.5 - y / w * 0.5) * ny) * nx + Math.floor((x / w * 0.5 + 0.5) * nx);
+      density[tile] += leaf.mass / 32;
+      nearest[tile] = Math.min(nearest[tile], w);
+      visible.push({ tile, distance: w });
+    }
+    return visible;
   });
-  return bytes;
+  const scores = probes.map((samples, i) => samples.reduce((sum, p) => {
+    const depthDifference = (p.distance - nearest[p.tile]) / Math.max(nearest[p.tile] * 0.025, 1e-6);
+    const visibility = 0.2 + 0.8 / (1 + depthDifference);
+    return sum + leaves[i].mass / 32 * visibility / Math.sqrt(density[p.tile]);
+  }, 0));
+  const total = scores.reduce((sum, v) => sum + v, 0);
+  const mass = leaves.reduce((sum, l) => sum + l.mass, 0);
+  return leaves.map((l, i) => total > 0 ? 0.15 * l.mass / mass + 0.85 * scores[i] / total : l.mass / mass);
+}
+
+// Split the full drawing budget at particle-buffer boundaries. Each draw
+// references valid base-particle indices, even at N=100M and 32 transforms.
+// At most leafCount + transformCount - 1 draws are needed.
+export function packViewDraws(leaves, particles, transformCount, fit, weights) {
+  const total = particles * transformCount;
+  const draws = [];
+  if (!leaves.length) return { bytes: new ArrayBuffer(VIEW_LEAF_BYTES), draws, vertices: 0 };
+  const weightSum = weights.reduce((sum, v) => sum + v, 0);
+  let cumulative = 0, start = 0;
+  leaves.forEach((leaf, i) => {
+    cumulative += weights[i];
+    const end = i === leaves.length - 1 ? total
+      : i + 1 + Math.floor((total - leaves.length) * cumulative / weightSum);
+    const matrix = multiply64(fit, leaf.matrix);
+    while (start < end) {
+      const copy = Math.floor(start / particles);
+      const next = Math.min(end, (copy + 1) * particles);
+      draws.push({ first: start % particles, count: next - start, copy, matrix });
+      start = next;
+    }
+  });
+  const bytes = new ArrayBuffer(draws.length * VIEW_LEAF_BYTES);
+  draws.forEach((draw, i) => {
+    new Float32Array(bytes, i * VIEW_LEAF_BYTES, 16).set(draw.matrix);
+    new Uint32Array(bytes, i * VIEW_LEAF_BYTES + 64, 4).set([draw.copy, 0, 0, 0]);
+  });
+  return { bytes, draws, vertices: total };
 }

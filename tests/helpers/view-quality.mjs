@@ -1,20 +1,41 @@
 import { batchPoints, fullDepth } from "./sampling.mjs";
-import { packViewLeaves, VIEW_LEAF_BYTES } from "../../web/js/view-sampling.js";
+import { packViewDraws } from "../../web/js/view-sampling.js";
+import { mat4 } from "../../web/js/math.js";
 
 export function transformPoint(m, p) {
   return [0, 1, 2].map(r => m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r]);
 }
 
-export function focusedPoints(matrices, plan, particles, batch = 0) {
-  const points = batchPoints(matrices, particles, batch, fullDepth(matrices.length, particles));
-  const packed = packViewLeaves(plan.leaves, particles);
-  let leaf = 0;
-  for (let i = 0; i < particles; i++) {
-    while (Math.floor(i / 64) >= new Uint32Array(packed, leaf * VIEW_LEAF_BYTES + 64, 1)[0]) leaf++;
-    const m = new Float32Array(packed, leaf * VIEW_LEAF_BYTES, 16);
-    points.set(transformPoint(m, points.subarray(i * 3, i * 3 + 3)), i * 3);
+export function focusedPoints(matrices, plan, particles, batch = 0, weights = plan.leaves.map(l => l.mass)) {
+  const base = batchPoints(matrices, particles, batch, fullDepth(matrices.length, particles));
+  const points = new Float32Array(particles * matrices.length * 3);
+  const { draws } = packViewDraws(plan.leaves, particles, matrices.length, mat4.identity(), weights);
+  let at = 0;
+  for (const draw of draws) for (let i = draw.first; i < draw.first + draw.count; i++) {
+    const child = matrices[(i + draw.copy) % matrices.length];
+    points.set(transformPoint(draw.matrix, transformPoint(child, base.subarray(i * 3, i * 3 + 3))), at++ * 3);
   }
   return points;
+}
+
+export function sampleFit(points) {
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity], mean = [0, 0, 0];
+  const n = points.length / 3;
+  for (let i = 0; i < points.length; i++) {
+    const r = i % 3;
+    lo[r] = Math.min(lo[r], points[i]); hi[r] = Math.max(hi[r], points[i]); mean[r] += points[i] / n;
+  }
+  const extent = Math.max(Math.hypot(...lo.map((v, r) => v - mean[r])), Math.hypot(...hi.map((v, r) => v - mean[r])));
+  const fit = mat4.identity(), scale = 1.4925 / extent;
+  fit[0] = fit[5] = fit[10] = scale;
+  for (let r = 0; r < 3; r++) fit[12 + r] = -mean[r] * scale;
+  return fit;
+}
+
+export function centeredView(distance, aspect = 4 / 3) {
+  const eye = [Math.cos(0.45) * Math.cos(0.6), Math.sin(0.45), Math.cos(0.45) * Math.sin(0.6)].map(v => v * distance);
+  return mat4.multiply(mat4.perspective(Math.PI / 3, aspect, distance * 0.004, distance * 60 + 50),
+    mat4.lookAt(eye, [0, 0, 0], [0, 1, 0]));
 }
 
 // Independent pixel/depth projection, including the old renderer's M copies.

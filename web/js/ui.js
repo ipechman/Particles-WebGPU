@@ -310,11 +310,23 @@ export function buildUI(engine, blender, camera) {
   });
 
   const fpsEl = $("fps");
+  const samplingStatus = $("samplingStatus");
   return {
+    updateStatus() {
+      let message;
+      if (engine.samplingMode === "global") message = "Global sampling selected";
+      else if (blender.animate && engine.frameMode === "compute") message = "Pause morphing to focus the current shape";
+      else if (engine._fitReadbackFailed) message = "Focus unavailable: could not read the shape fit";
+      else if (engine.viewStats.reason === "uncertified bounds") message = "Focus unavailable for this shape; using Global";
+      else if (engine._viewPending || engine._fitPending) message = "Preparing focus…";
+      else if (engine._viewActive) message = engine.viewStats.vertices ? "Focus active" : "Focus active — shape outside the view";
+      else message = blender.animate ? "Pause morphing to focus the current shape" : "Preparing focus…";
+      if (samplingStatus.textContent !== message) samplingStatus.textContent = message;
+    },
     setFps(fps) {
       // Accumulated batches multiply the points actually baked into the frame.
-      const copies = engine._viewActive ? (engine.viewStats.leaves ? 1 : 0) : blender.getTransformCount();
-      const pts = engine.particlesPerBatch * copies * Math.max(1, engine._accumCount);
+      const perBatch = engine._viewActive ? engine.viewStats.vertices : engine.particlesPerBatch * blender.getTransformCount();
+      const pts = perBatch * Math.max(1, engine._accumCount);
       fpsEl.textContent = `${fps.toFixed(0)} fps · ${pts.toLocaleString()} pts`;
       if (engine.samplingMode === "view") fpsEl.textContent += engine._viewActive ? " · view focused" : " · global";
       const timing = engine.profiler?.latest;
