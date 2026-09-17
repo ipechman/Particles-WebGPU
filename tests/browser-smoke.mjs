@@ -122,14 +122,18 @@ async function slider(id, value) {
 
 try {
   browser = await chromium.launch({
-    // Use the full browser's compositor: headless-shell cannot provide the
-    // WebGPU canvas shared-image backing on this software adapter.
+    // Use the full browser and Vulkan compositor with a software Vulkan
+    // driver so WebGPU canvas textures can be shared with the compositor.
     channel: "chromium",
     headless: true,
     // Software shader compilation/execution can exceed Chromium's hardware
     // watchdog budget on a shared CI CPU. JS/GPU errors and suite timeouts
     // remain fatal; this does not disable WebGPU validation.
-    args: ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--disable-gpu-watchdog"],
+    args: [
+      "--enable-unsafe-webgpu", "--use-gl=angle", "--use-angle=vulkan",
+      "--use-vulkan=swiftshader", "--enable-features=Vulkan",
+      "--disable-vulkan-surface", "--enable-unsafe-swiftshader", "--disable-gpu-watchdog",
+    ],
   });
   browserVersion = browser.version();
   console.log(`Chromium ${browserVersion}`);
