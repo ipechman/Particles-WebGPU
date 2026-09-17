@@ -158,6 +158,8 @@ export async function runFocusChecks({ page, check, settled, screenshot, slider,
     await page.locator("#theme").selectOption("gilded-lagoon");
     await page.locator("#displayMode").selectOption("detail"); await slider("bloom", 0.25);
     await page.evaluate(() => { window.__app.engine.accumTargetPoints = window.__app.engine.particlesPerBatch; });
+    // Explicitly start a fresh image after reducing the test-only batch budget.
+    await page.locator("#sampling").selectOption("view"); await settled();
     await page.locator("#sampling").selectOption("global"); await settled();
     const global = await screenshot("normal-shaded-global");
     await page.locator("#sampling").selectOption("view"); await settled();

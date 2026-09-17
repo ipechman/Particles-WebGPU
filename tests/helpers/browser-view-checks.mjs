@@ -67,7 +67,12 @@ export async function runViewChecks({ page, check, settled, screenshot, slider, 
 
   await check("focused accumulation, camera changes, resize, and global return preserve the fit", async () => {
     await page.locator("#sampling").selectOption("view");
-    await page.evaluate(() => { window.__app.engine.accumTargetPoints = 32768 * 4; });
+    await page.evaluate(() => {
+      window.__app.engine.accumTargetPoints = 32768 * 4;
+      // The budget is test-only state. Move the camera to start a fresh image
+      // when reducing it below the batches already accumulated by the last test.
+      window.__app.camera.yaw += 0.01;
+    });
     await settled();
     const fit = await page.evaluate(() => Array.from(window.__app.engine._fitCPU));
     await page.locator("#refinement").selectOption("reuse");
