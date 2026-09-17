@@ -57,6 +57,61 @@ as they are, so the exact appearance depends on the current fractal and AO/bloom
 Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
 (Node.js 22.7 or newer; no dependencies or build step required).
 
+### Performance and refinement
+
+- **Refinement — Fast** (default) generates the first batch at full depth, then
+  advances each stored point by four chaos-game hops while the shape and view
+  remain still. **Independent** generates every batch at full depth for comparison.
+  Shape changes restart sampling; moving the camera restarts image accumulation.
+  Both modes refine toward the existing 67M base-sample target. These are samples,
+  not a guarantee of 67M distinct visible pixels; rendering multiplies the count
+  by the number of transforms.
+- **Lighting — Full** (default) retains all particles for voxel occupancy.
+  **Balanced** caps lighting samples at about 2M and **Fast** at 524K, without
+  lowering the number of rendered particles. Reduced lighting budgets may change
+  shadows in sparse regions. Lighting stays fixed during one accumulation cycle.
+- Positions retain float32 precision in packed 12-byte records (25% less storage
+  than the previous 16-byte layout). Compute dispatches avoid mostly empty rows,
+  batches use disjoint counter ranges, voxel occupancy uses atomic writes, and AO
+  reuses a shared-memory neighborhood tile. Bloom/Kuwahara results are reused
+  whenever the displayed image and relevant effect settings are unchanged.
+
+Open `?profile=1` to enable optional GPU timestamps, sampled every 30 frames.
+`window.__app.engine.profiler.latest` contains timings by pass and their sum.
+The displayed **GPU passes** value excludes copies and gaps between passes; it
+is not total frame latency. Unsupported adapters render normally without timings.
+Readbacks are asynchronous and bounded; a busy profiling ring skips a sample.
+FPS uses actual wall time, independently of the simulation timestep clamp.
+
+For repeatable tests, URL parameters can set `particles` (64–100M), `accum`
+(target base samples, 64–1,073,741,824), and `grid` (16, 32, 64, or 128).
+For example: `?particles=262144&accum=1048576&grid=32&profile=1`.
+Normal visits retain the original 8.4M particles, 128³ grid, and 67M target.
+
+### Validation
+
+```sh
+npm ci
+npm test
+npx playwright install --with-deps chromium
+npm run test:browser
+node tests/helpers/sampling.mjs --benchmark
+```
+
+The browser suite runs the real app in Chromium with software WebGPU. It checks
+WGSL compilation, GPU errors, nonblank rendering, presets/palettes, accumulation,
+camera controls, resizing, lighting, effects, cache invalidation, and profiling.
+Screenshots and a JSON report are written under `test-results/browser/` and
+uploaded by the regression workflow. Software-adapter timings are not hardware
+performance benchmarks. No npm packages are loaded by the deployed site.
+
+The CPU sampling benchmark compares six frozen 2D, 3D, and procedural shapes.
+At 32,768 particles × eight batches and a 1024² projection, four-hop refinement
+retained 99.708%–100.053% of the independent reference's occupied-pixel count,
+using 31.94%–39.42% as many affine operations. These checks are not pixel-perfect
+equivalence or measured FPS gains; camera views, zoom, and shapes outside the
+fixtures may differ. The Independent option remains available for comparison.
+
 ## What it does (preserved from the original)
 
 The graphical pipeline mirrors the Unity project one-to-one:
@@ -69,8 +124,8 @@ The graphical pipeline mirrors the Unity project one-to-one:
    particle starts on a transform's fixed point (an exact attractor point) and
    applies a hash-driven sequence of transforms, so every rendered point lies
    on the attractor.
-3. **Auto-fit** — a low-detail copy of the attractor is reduced (min/max/sum on
-   the GPU) to predict a bounding box, and a "final transform" rescales and
+3. **Auto-fit** — the initial particle batch is reduced (min/max/sum on
+   the GPU) to calculate a bounding box, and a "final transform" rescales and
    recenters the fractal to fill the view.
 4. **Voxelization + ambient occlusion** — the cloud is splatted into a 3D voxel
    grid and a brute-force AO approximation (3×3×3 neighbourhood) is computed,
@@ -102,7 +157,6 @@ web/
     ui.js               control panel wiring
   shaders/
     iterate.wgsl        attractor iteration
-    lod.wgsl            low-detail generation for bounds prediction
     reduce.wgsl         parallel min/max/sum reduction
     fit.wgsl            auto-fit final transform
     voxelize.wgsl       voxel grid + ambient occlusion

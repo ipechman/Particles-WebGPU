@@ -21,3 +21,4 @@ $RECYCLE.BIN/
 .vscode/
 *.suo
 *.user
+test-results/

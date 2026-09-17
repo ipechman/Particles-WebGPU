@@ -22,7 +22,9 @@ struct Bounds {
   sm: vec3<f32>,
 };
 
-@group(0) @binding(0) var<storage, read> points: array<vec3<f32>>;
+struct Point { x: f32, y: f32, z: f32 };
+
+@group(0) @binding(0) var<storage, read> points: array<Point>;
 @group(0) @binding(1) var<storage, read_write> outBounds: array<Bounds>;
 @group(0) @binding(2) var<uniform> u: Reduce;
 @group(0) @binding(3) var<storage, read> inBounds: array<Bounds>;
@@ -64,7 +66,8 @@ fn reducePoints(
   let step = nwg.x * WG;
   loop {
     if (i >= u.inputSize) { break; }
-    let v = points[i];
+    let p = points[i];
+    let v = vec3<f32>(p.x, p.y, p.z);
     mn = min(mn, v);
     mx = max(mx, v);
     sm = sm + v;

@@ -22,7 +22,9 @@ struct Render {
   paletteStops: array<vec4<f32>, 6>,
 };
 
-@group(0) @binding(0) var<storage, read> positions: array<vec3<f32>>;
+struct Point { x: f32, y: f32, z: f32 };
+
+@group(0) @binding(0) var<storage, read> positions: array<Point>;
 // combined[i] = finalTransform * transforms[i], premultiplied by combine.wgsl
 // so each of the ~25M instanced vertices applies a single matrix.
 @group(0) @binding(1) var<storage, read> combined: array<mat4x4<f32>>;
@@ -54,7 +56,8 @@ fn getTrilinearVoxel(pos: vec3<f32>) -> f32 {
 
 @vertex
 fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOut {
-  let basePos = positions[vid];
+  let p = positions[vid];
+  let basePos = vec3<f32>(p.x, p.y, p.z);
   let world = combined[iid] * vec4<f32>(basePos, 1.0);
 
   let halfBounds = u.gridBounds * 0.5;

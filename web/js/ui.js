@@ -53,6 +53,19 @@ export function buildUI(engine, blender, camera) {
     particles.appendChild(o);
   }
   particles.value = String(engine.particlesPerBatch);
+  // Nonstandard counts can be supplied by reproducible profiling URLs.
+  if (!particles.value) {
+    const option = document.createElement("option");
+    option.value = String(engine.particlesPerBatch);
+    option.textContent = fmt(engine.particlesPerBatch);
+    particles.appendChild(option);
+    particles.value = option.value;
+  }
+  $("refinement").value = engine.accumulationMode;
+  $("refinement").addEventListener("change", (e) => { engine.accumulationMode = e.target.value; });
+  $("lighting").addEventListener("change", (e) => {
+    engine.lightingParticleBudget = e.target.value === "full" ? Infinity : Number(e.target.value);
+  });
 
   // Initial control values.
   const pcount = $("pcount");
@@ -290,6 +303,8 @@ export function buildUI(engine, blender, camera) {
       // Accumulated batches multiply the points actually baked into the frame.
       const pts = engine.particlesPerBatch * blender.getTransformCount() * Math.max(1, engine._accumCount);
       fpsEl.textContent = `${fps.toFixed(0)} fps · ${pts.toLocaleString()} pts`;
+      const timing = engine.profiler?.latest;
+      if (timing) fpsEl.textContent += ` · GPU passes ${timing.totalMs.toFixed(1)} ms`;
     },
   };
 }

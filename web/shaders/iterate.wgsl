@@ -12,8 +12,9 @@
 // All choices derive from a PCG hash of (particle index, batch seed), so the
 // cloud is deterministic: identical transforms produce an identical cloud (no
 // temporal shimmer, and the engine's static-frame compute cache stays valid).
-// Distinct batch seeds give independent samples of the same distribution,
-// which progressive accumulation uses on static frames.
+// A counter gives each batch a disjoint range of hash inputs. The engine caps
+// the batch count before that counter wraps at 2^32. Progressive accumulation
+// can continue these chains instead of paying for initialization again.
 //
 // Compared with the previous breadth-first tree enumeration (one generation
 // per dispatch, every tree node rendered) this runs in a single dispatch,
@@ -27,13 +28,16 @@ struct Chaos {
   width: u32,     // threads spanned by the x dispatch dimension (2D flattening)
   iters: u32,
   batchSeed: u32,
-  _p0: u32,
+  advance: u32, // continue the current cloud when accumulating a static shape
   _p1: u32,
   _p2: u32,
   seeds: array<vec4<f32>, 32>, // fixed point of each transform (xyz)
 };
 
-@group(0) @binding(0) var<storage, read_write> positions: array<vec3<f32>>;
+// Three scalar members have a 12-byte stride; array<vec3<f32>> uses 16 bytes.
+struct Point { x: f32, y: f32, z: f32 };
+
+@group(0) @binding(0) var<storage, read_write> positions: array<Point>;
 @group(0) @binding(1) var<storage, read> transforms: array<mat4x4<f32>>;
 @group(0) @binding(2) var<uniform> u: Chaos;
 
@@ -50,13 +54,17 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.y * u.width + gid.x;
   if (idx >= u.particleCount) { return; }
 
-  var h = pcg(idx ^ pcg(u.batchSeed ^ 0x9E3779B9u));
+  var h = pcg(idx + u.batchSeed * u.particleCount);
   var pos = u.seeds[h % u.count].xyz;
+  if (u.advance != 0u) {
+    let p = positions[idx];
+    pos = vec3<f32>(p.x, p.y, p.z);
+  }
 
   for (var k = 0u; k < u.iters; k = k + 1u) {
     h = pcg(h);
     pos = (transforms[h % u.count] * vec4<f32>(pos, 1.0)).xyz;
   }
 
-  positions[idx] = pos;
+  positions[idx] = Point(pos.x, pos.y, pos.z);
 }

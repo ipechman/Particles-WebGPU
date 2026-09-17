@@ -1,0 +1,36 @@
+name: Regression tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'perf/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  webgpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - name: Chromium software WebGPU smoke test
+        run: npm run test:browser
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-browser-evidence
+          path: test-results/browser/
+          if-no-files-found: ignore
+          retention-days: 14
