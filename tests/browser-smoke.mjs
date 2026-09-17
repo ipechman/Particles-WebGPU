@@ -78,7 +78,8 @@ async function settled() {
   await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   await page.waitForFunction(() => {
     const e = window.__app.engine;
-    return e.frameMode === "idle" && (e.samplingMode !== "view" || e._fitReadbackFailed || (e._fitCPU && e._viewKey && !e._fitPending));
+    return e.frameMode === "idle" && (e.samplingMode !== "view" || e._fitReadbackFailed ||
+      (e._fitCPU && e._viewKey && !e._fitPending && !e._viewPending));
   }, null, { timeout: 90_000 });
   await page.evaluate(() => window.__app.engine.device.queue.onSubmittedWorkDone());
   await healthy();

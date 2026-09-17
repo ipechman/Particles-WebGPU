@@ -768,6 +768,8 @@ export class Engine {
     const previous = this._viewActive;
     if (this.samplingMode !== "view" || !this._fitCPU) {
       this._viewActive = false;
+      this._viewPending = false;
+      this._viewRequestedKey = null;
       if (this.samplingMode !== "view") {
         this._viewKey = null;
         this.viewStats = { active: false, reason: "global" };
@@ -776,7 +778,15 @@ export class Engine {
     }
     const vp = new Float32Array(rb, 0, 16);
     const key = `${this._fitRevision}:${this.particlesPerBatch}:${this._fbW}:${this._fbH}:${Array.from(vp)}`;
-    if (key === this._viewKey) return false;
+    if (key === this._viewKey) { this._viewPending = false; return false; }
+    if (key !== this._viewRequestedKey) {
+      this._viewRequestedKey = key;
+      this._viewChangedAt = performance.now();
+    }
+    // Keep camera interaction on the cheap redraw path. Generate a new cloud
+    // after the view has been still briefly, not on every pointer event.
+    this._viewPending = performance.now() - this._viewChangedAt < 80;
+    if (this._viewPending) return false;
     this._viewKey = key;
     const start = performance.now();
     const matrices = Array.from({ length: count }, (_, i) => this.transformData.slice(i * 16, i * 16 + 16));

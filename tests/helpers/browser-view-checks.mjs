@@ -121,7 +121,7 @@ export async function runViewChecks({ page, check, settled, screenshot, slider, 
   const comparisons = [];
   for (const [preset, offset] of [
     ["SierpinskiTriangle2D", [0.015, 0.01, 0.09]],
-    ["SierpinskiTriangle3D", [0.04, 0.04, 0.09]],
+    ["SierpinskiTriangle3D", [0.045, 0.045, 0.09]],
     ["Vicsek3D", [0.015, 0.01, 0.09]],
   ]) {
     await check(`equal particle budget close-up and 32x reference: ${preset}`, async () => {
@@ -178,7 +178,7 @@ export async function runViewChecks({ page, check, settled, screenshot, slider, 
       for (let i = 0; i < a.length; i++) if (nearReference(i)) { globalSupported += a[i]; focusedSupported += b[i]; }
       assert.ok(focusedSupported / focused.brightPixels > 0.95, "Focused pixels must agree with the dense reference within one pixel");
       assert.ok(focusedSupported > globalSupported * 1.5);
-      const result = { preset, particles: 32768, batches: 1, globalVertices: 32768 * focusedState.transformCount,
+      const result = { preset, offset, fit, particles: 32768, batches: 1, globalVertices: 32768 * focusedState.transformCount,
         focusedVertices: 32768, globalPixels: global.brightPixels, focusedPixels: focused.brightPixels,
         coverageRatio: focused.brightPixels / global.brightPixels, referenceBatches: 32,
         focusedReferenceAgreement: focusedSupported / focused.brightPixels, planning: focusedState.view };

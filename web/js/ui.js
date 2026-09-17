@@ -66,7 +66,7 @@ export function buildUI(engine, blender, camera) {
   $("sampling").value = engine.samplingMode;
   $("sampling").addEventListener("change", (e) => { engine.samplingMode = e.target.value; });
   $("displayMode").value = engine.displayMode;
-  const updateExposure = () => { $("exposureRow").hidden = engine.displayMode !== "detail"; };
+  const updateExposure = () => { $("exposureRow").style.display = engine.displayMode === "detail" ? "" : "none"; };
   $("displayMode").addEventListener("change", (e) => { engine.displayMode = e.target.value; updateExposure(); });
   $("exposure").value = String(engine.exposure);
   $("exposureVal").textContent = engine.exposure.toFixed(2);

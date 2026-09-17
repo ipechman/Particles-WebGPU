@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { attractorBounds, projectedBox, buildViewPlan, packViewLeaves, multiply64, VIEW_LEAF_BYTES } from "../web/js/view-sampling.js";
 import { mat4 } from "../web/js/math.js";
+import { Engine } from "../web/js/engine.js";
 import { qualityFixtures, fixedPoint, batchPoints, fullDepth } from "./helpers/sampling.mjs";
 import { focusedPoints, projectPoints } from "./helpers/view-quality.mjs";
 
@@ -78,4 +79,42 @@ test("overlapping 3D overview keeps the denser global draw", () => {
   const plan = buildViewPlan({ matrices, bounds: attractorBounds(matrices, matrices.map(fixedPoint)),
     viewFit, width: 512, height: 512, particles: 16384 });
   assert.equal(plan.active, false);
+});
+
+test("100M particles use a bounded leaf table and an exact workgroup budget", () => {
+  const { matrices } = qualityFixtures[0];
+  const viewFit = multiply64(mat4.perspective(Math.PI / 3, 1, 1e-5, 100),
+    mat4.lookAt([-.49, -.49, .09], [-.5, -.5, 0], [0, 1, 0]));
+  const plan = buildViewPlan({ matrices, bounds: attractorBounds(matrices, matrices.map(fixedPoint)),
+    viewFit, width: 3840, height: 2160, particles: 100000000 });
+  assert.equal(plan.active, true);
+  const table = packViewLeaves(plan.leaves, 100000000);
+  assert.ok(table.byteLength <= 81920 && plan.visited <= 8192);
+  assert.equal(new Uint32Array(table, (plan.leaves.length - 1) * VIEW_LEAF_BYTES + 64, 1)[0], 1562500);
+});
+
+test("fit readback is bounded and discards results from old geometry", async () => {
+  const e = new Engine({});
+  let complete;
+  let mapped = 0, unmapped = 0, copied = 0;
+  const result = mat4.identity();
+  e.fitReadback = { mapAsync: () => { mapped++; return new Promise(resolve => { complete = resolve; }); },
+    getMappedRange: () => result.buffer, unmap: () => { unmapped++; } };
+  const oldMode = globalThis.GPUMapMode;
+  globalThis.GPUMapMode = { READ: 1 };
+  try {
+    const enc = { copyBufferToBuffer: () => { copied++; } };
+    const revision = e._encodeFitReadback(enc);
+    assert.equal(e._encodeFitReadback(enc), null);
+    e._readFit(revision);
+    e._fitRevision++;
+    complete(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(e._fitCPU, undefined);
+    assert.equal(e._fitPending, false);
+    e._readFit(e._encodeFitReadback(enc));
+    complete(); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(e._fitCPU, result);
+    assert.equal(e._encodeFitReadback(enc), null);
+    assert.deepEqual([mapped, unmapped, copied], [2, 2, 2]);
+  } finally { globalThis.GPUMapMode = oldMode; }
 });
