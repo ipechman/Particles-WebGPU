@@ -167,6 +167,8 @@ select option {
   color: var(--text);
 }
 
+select:disabled { opacity: 0.45; cursor: not-allowed; }
+
 button.full {
   background: rgba(127, 216, 196, 0.14);
   color: var(--accent);

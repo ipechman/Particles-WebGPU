@@ -92,7 +92,9 @@ export async function runFocusChecks({ page, check, settled, screenshot, slider,
         await page.evaluate(instructions => window.__app.blender.loadShape(instructions), fixture.instructions);
       }
       await page.locator("#particles").selectOption("262144");
+      await page.locator("#refinePasses").selectOption("2");
       await page.locator("#refinement").selectOption("independent");
+      await page.locator("#refinePasses").selectOption("1");
       await page.locator("#displayMode").selectOption("classic");
       await page.locator("#theme").selectOption("ivory");
       await slider("bloom", 0);
@@ -101,8 +103,7 @@ export async function runFocusChecks({ page, check, settled, screenshot, slider,
         el.value = "#ffffff"; el.dispatchEvent(new Event("input", { bubbles: true }));
       });
       await page.evaluate(() => {
-        const { engine: e, camera: c } = window.__app;
-        e.accumTargetPoints = e.particlesPerBatch;
+        const { camera: c } = window.__app;
         c.target = [0, 0, 0]; c.yaw = 0.6; c.pitch = 0.45; c.distance = 4.5;
       });
       await page.locator("#sampling").selectOption("view"); await settled();
@@ -130,7 +131,7 @@ export async function runFocusChecks({ page, check, settled, screenshot, slider,
       assert.deepEqual(after.fit, initial.fit); assert.equal(after.seed, initial.seed); assert.equal(after.sameBuffer, true);
 
       await page.locator("#sampling").selectOption("global");
-      await page.evaluate(() => { window.__app.engine.accumTargetPoints = 262144 * 8; });
+      await page.locator("#refinePasses").selectOption("8");
       await settled(); await screenshot(`normal-${name}-reference`);
       const ref = PNG.sync.read(await readFile(resolve(artifacts, `normal-${name}-reference.png`)));
       const f = PNG.sync.read(await readFile(resolve(artifacts, `normal-${name}-focus.png`)));
@@ -157,9 +158,7 @@ export async function runFocusChecks({ page, check, settled, screenshot, slider,
   await check("paused normal view visibly changes with the actual palette and Detail display", async () => {
     await page.locator("#theme").selectOption("gilded-lagoon");
     await page.locator("#displayMode").selectOption("detail"); await slider("bloom", 0.25);
-    await page.evaluate(() => { window.__app.engine.accumTargetPoints = window.__app.engine.particlesPerBatch; });
-    // Explicitly start a fresh image after reducing the test-only batch budget.
-    await page.locator("#sampling").selectOption("view"); await settled();
+    await page.locator("#refinePasses").selectOption("1");
     await page.locator("#sampling").selectOption("global"); await settled();
     const global = await screenshot("normal-shaded-global");
     await page.locator("#sampling").selectOption("view"); await settled();
@@ -167,5 +166,6 @@ export async function runFocusChecks({ page, check, settled, screenshot, slider,
     assert.notEqual(global.hash, focus.hash);
   });
   await page.locator("#particles").selectOption("32768");
+  await page.locator("#refinePasses").selectOption("auto");
   await page.setViewportSize({ width: 640, height: 480 }); await settled();
 }

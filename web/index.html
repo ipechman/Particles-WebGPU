@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Point Cloud Fractals — WebGPU</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
@@ -60,15 +61,26 @@
         <select id="particles"></select>
       </label>
 
-      <label class="row" title="Fast reuses samples while the shape is still. Independent generates each refinement batch from scratch for comparison.">
+      <label class="row" title="Additional passes fill gaps while reusing the same particle buffer. More passes take longer. Selecting a budget pauses morphing. Auto targets about 67M base samples, so 100M particles gets one pass.">
         <span>Refinement</span>
-        <select id="refinement">
+        <select id="refinePasses" aria-describedby="refinementStatus">
+          <option value="auto">Auto</option>
+          <option value="1">Off · 1 pass</option>
+          <option value="2">2 passes</option>
+          <option value="4">4 passes</option>
+          <option value="8">8 passes</option>
+        </select>
+      </label>
+      <label class="row" title="Controls how additional passes are generated, not how many. Both methods converge toward the same fractal. Fast advances existing samples; Independent regenerates them. Unused for a single pass. Selecting pauses morphing.">
+        <span>Method</span>
+        <select id="refinement" aria-describedby="refinementStatus">
           <option value="reuse">Fast</option>
           <option value="independent">Independent</option>
         </select>
       </label>
+      <div id="refinementStatus" class="sampling-status" role="status" aria-live="polite"></div>
 
-      <label class="row" title="Focus redistributes the same particle and drawing budget toward the current view. Pause morphing to inspect a steady shape. Global keeps the original distribution.">
+      <label class="row" title="Selecting either sampler pauses morphing so you can compare the same shape. Focus redistributes the same particle and drawing budget toward the current view. Global keeps the original distribution.">
         <span>Sampling</span>
         <select id="sampling">
           <option value="view">Focus</option>

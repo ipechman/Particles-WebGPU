@@ -61,10 +61,26 @@ export function buildUI(engine, blender, camera) {
     particles.appendChild(option);
     particles.value = option.value;
   }
-  $("refinement").value = engine.accumulationMode;
-  $("refinement").addEventListener("change", (e) => { engine.accumulationMode = e.target.value; });
+  const pauseForInspection = () => {
+    blender.animate = false;
+    $("animate").checked = false;
+  };
+  const refinement = $("refinement");
+  refinement.value = engine.accumulationMode;
+  refinement.addEventListener("change", (e) => {
+    pauseForInspection();
+    engine.accumulationMode = e.target.value;
+  });
+  $("refinePasses").value = String(engine.refinementPasses);
+  $("refinePasses").addEventListener("change", (e) => {
+    pauseForInspection();
+    engine.refinementPasses = e.target.value === "auto" ? "auto" : Number(e.target.value);
+  });
   $("sampling").value = engine.samplingMode;
-  $("sampling").addEventListener("change", (e) => { engine.samplingMode = e.target.value; });
+  $("sampling").addEventListener("change", (e) => {
+    pauseForInspection();
+    engine.samplingMode = e.target.value;
+  });
   $("displayMode").value = engine.displayMode;
   const updateExposure = () => { $("exposureRow").style.display = engine.displayMode === "detail" ? "" : "none"; };
   $("displayMode").addEventListener("change", (e) => { engine.displayMode = e.target.value; updateExposure(); });
@@ -311,8 +327,17 @@ export function buildUI(engine, blender, camera) {
 
   const fpsEl = $("fps");
   const samplingStatus = $("samplingStatus");
+  const refinementStatus = $("refinementStatus");
   return {
     updateStatus() {
+      const target = engine._accumBatchTarget();
+      refinement.disabled = target === 1;
+      let progress;
+      if (target === 1) progress = "Single pass · choose 2+ passes to refine";
+      else if (blender.animate && engine.frameMode === "compute") progress = "Waiting for a steady shape · selecting refinement pauses morphing";
+      else if (engine._accumCount < target) progress = `Refining ${engine._accumCount} / ${target} passes`;
+      else progress = `Complete · ${target} passes`;
+      if (refinementStatus.textContent !== progress) refinementStatus.textContent = progress;
       let message;
       if (engine.samplingMode === "global") message = "Global sampling selected";
       else if (blender.animate && engine.frameMode === "compute") message = "Pause morphing to focus the current shape";

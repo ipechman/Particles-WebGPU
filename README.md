@@ -34,10 +34,16 @@ Needs a WebGPU-capable browser (recent Chrome / Edge / Chromium).
   fractal is sized inside the lighting box).
 - **Post-processing**: a toggle for the original **Kuwahara filter** (Acerola's
   edge-preserving painterly filter) and a **bloom** slider (0 disables it).
-- **Sampling — Focus** (default) reallocates the existing particle and drawing
-  budget toward the current view. It works at the default camera and ordinary
-  centered zooms. The status below the control explicitly says **Focus active**,
-  **Preparing focus**, or explains why the shape is unsupported.
+- **Sampling** starts on **Global** while the shape morphs. Selecting **Focus**
+  pauses the current shape and reallocates the existing particle and drawing
+  budget toward the view. Selecting either sampler freezes the same shape for
+  comparison. Its status says **Focus active**, **Preparing focus**, or explains
+  why focusing is unavailable. Resuming morphing suspends focusing until steady.
+- **Refinement** controls the number of passes: **Auto**, **Off · 1 pass**, or
+  **2 / 4 / 8 passes**. Selecting it pauses the shape for inspection. Additional
+  passes reuse the same particle buffer but take more time. Progress appears
+  below the control. **Auto uses only one pass at 100M particles**; choose an
+  explicit pass count to keep refining that image.
 - Pausing morphing freezes the current shape immediately. Resuming continues the
   transition; **Randomize** while paused selects a new static shape immediately.
 - **Display — Detail** (default) adds small-scale depth shading and compresses
@@ -69,15 +75,20 @@ Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
 
 ### Performance and refinement
 
-- **Refinement — Fast** (default) generates the first batch at full depth, then
+- **Method — Fast** (default) generates the first batch at full depth, then
   advances each stored point by four chaos-game hops while the shape and view
   remain still. **Independent** generates every batch at full depth for comparison.
+  These are generation strategies, not different quality levels; they converge
+  toward the same fractal. The method selector is disabled for a single pass,
+  where both strategies execute exactly the same full-depth initial batch.
   Shape changes restart sampling; moving the camera restarts image accumulation.
-  Both modes refine toward the existing 67M base-sample target. These are samples,
+  Auto refines toward the existing 67M base-sample target. Explicit pass counts
+  override that target without allocating another particle buffer. These are samples,
   not a guarantee of 67M distinct visible pixels. Both Global and Focus draw
   N × transformCount vertices per batch. Both retain the same base cloud, so Fast
   refinement works in either sampling mode. Switching samplers with a one-batch
   budget preserves the exact base samples as well as the fit and lighting.
+  Changing the pass budget restarts the image while preserving fit and lighting.
 - **Lighting — Full** (default) retains all particles for voxel occupancy.
   **Balanced** caps lighting samples at about 2M and **Fast** at 524K, without
   lowering the number of rendered particles. Reduced lighting budgets may change
@@ -158,7 +169,13 @@ WGSL compilation, GPU errors, nonblank rendering, presets/palettes, accumulation
 camera controls, resizing, lighting, effects, cache invalidation, and profiling.
 View tests invoke the production vertex-position function on the GPU and compare
 it with independent CPU coordinates, check immediate pause in all morph modes,
-and require Focus to activate in 30 ordinary centered CPU views. Browser quality
+and require Focus to activate in 30 ordinary centered CPU views. The browser suite
+starts with morphing enabled and activates Focus through the visible selector;
+it no longer pauses manually before testing that startup behavior. Public pass
+controls must increase visible coverage, actually dispatch different Fast and
+Independent compute work, disable the method for a single pass, and reset the
+image when the pass count is reduced. CPU scheduler tests cover these budgets
+at 100M without allocating a 100M GPU buffer. Browser quality
 tests use the visible Sampling control, normal mouse-wheel zoom, a 1280×720 viewport,
 and the standard 262K particle option on two classic and two frozen procedural
 forms. Both modes use identical base samples, fit, particle count, and N×M drawing
