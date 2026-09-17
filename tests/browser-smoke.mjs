@@ -122,6 +122,9 @@ async function slider(id, value) {
 
 try {
   browser = await chromium.launch({
+    // Use the full browser's compositor: headless-shell cannot provide the
+    // WebGPU canvas shared-image backing on this software adapter.
+    channel: "chromium",
     headless: true,
     // Software shader compilation/execution can exceed Chromium's hardware
     // watchdog budget on a shared CI CPU. JS/GPU errors and suite timeouts
