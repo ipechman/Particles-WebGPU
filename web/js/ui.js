@@ -63,6 +63,18 @@ export function buildUI(engine, blender, camera) {
   }
   $("refinement").value = engine.accumulationMode;
   $("refinement").addEventListener("change", (e) => { engine.accumulationMode = e.target.value; });
+  $("sampling").value = engine.samplingMode;
+  $("sampling").addEventListener("change", (e) => { engine.samplingMode = e.target.value; });
+  $("displayMode").value = engine.displayMode;
+  const updateExposure = () => { $("exposureRow").style.display = engine.displayMode === "detail" ? "" : "none"; };
+  $("displayMode").addEventListener("change", (e) => { engine.displayMode = e.target.value; updateExposure(); });
+  $("exposure").value = String(engine.exposure);
+  $("exposureVal").textContent = engine.exposure.toFixed(2);
+  $("exposure").addEventListener("input", (e) => {
+    engine.exposure = Number(e.target.value);
+    $("exposureVal").textContent = engine.exposure.toFixed(2);
+  });
+  updateExposure();
   $("lighting").addEventListener("change", (e) => {
     engine.lightingParticleBudget = e.target.value === "full" ? Infinity : Number(e.target.value);
   });
@@ -301,8 +313,10 @@ export function buildUI(engine, blender, camera) {
   return {
     setFps(fps) {
       // Accumulated batches multiply the points actually baked into the frame.
-      const pts = engine.particlesPerBatch * blender.getTransformCount() * Math.max(1, engine._accumCount);
+      const copies = engine._viewActive ? (engine.viewStats.leaves ? 1 : 0) : blender.getTransformCount();
+      const pts = engine.particlesPerBatch * copies * Math.max(1, engine._accumCount);
       fpsEl.textContent = `${fps.toFixed(0)} fps · ${pts.toLocaleString()} pts`;
+      if (engine.samplingMode === "view") fpsEl.textContent += engine._viewActive ? " · view focused" : " · global";
       const timing = engine.profiler?.latest;
       if (timing) fpsEl.textContent += ` · GPU passes ${timing.totalMs.toFixed(1)} ms`;
     },

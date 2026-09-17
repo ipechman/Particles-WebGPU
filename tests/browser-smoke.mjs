@@ -11,6 +11,7 @@ import { chromium } from "playwright";
 import { PNG } from "pngjs";
 import { batchPoints, fixedPoint, fullDepth, qualityFixtures } from "./helpers/sampling.mjs";
 import { dispatchShape } from "../web/js/performance.js";
+import { runViewChecks } from "./helpers/browser-view-checks.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../web");
 const artifacts = resolve(root, "../test-results/browser");
@@ -60,6 +61,7 @@ const state = () => page.evaluate(() => {
     revision: engine.sceneRevision,
     postStats: { ...engine.postStats },
     profile: engine.profiler?.latest ?? null,
+    view: engine.viewStats,
   };
 });
 
@@ -74,7 +76,11 @@ async function settled() {
   // Cross a RAF boundary before checking: the UI event may have changed state
   // while frameMode still describes the preceding frame.
   await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-  await page.waitForFunction(() => window.__app.engine.frameMode === "idle", null, { timeout: 90_000 });
+  await page.waitForFunction(() => {
+    const e = window.__app.engine;
+    return e.frameMode === "idle" && (e.samplingMode !== "view" || e._fitReadbackFailed ||
+      (e._fitCPU && e._viewKey && !e._fitPending && !e._viewPending));
+  }, null, { timeout: 90_000 });
   await page.evaluate(() => window.__app.engine.device.queue.onSubmittedWorkDone());
   await healthy();
   const current = await state();
@@ -115,7 +121,8 @@ async function renderDiagnostics() {
       encoder.copyBufferToBuffer(packed, 0, metadata, 0, 176);
       encoder.copyBufferToBuffer(e.positionsBuf, 0, metadata, 176, 144);
       encoder.copyTextureToBuffer({ texture: e.sceneTexs[front] }, { buffer: textureReadback, bytesPerRow: rowBytes }, [width, height, 1]);
-      e._fullscreen(encoder, e.pipe.present, e.kuwaharaEnabled ? e.bgPresentKuw : e.bgPresentScene[front], presentTexture.createView());
+      e._fullscreen(encoder, e.pipe.present, e.kuwaharaEnabled ? e.bgPresentKuw
+        : e.displayMode === "detail" ? e.bgPresentDetail : e.bgPresentScene[front], presentTexture.createView());
       encoder.copyTextureToBuffer({ texture: presentTexture }, { buffer: presentReadback, bytesPerRow: presentRowBytes }, [width, height, 1]);
       d.queue.submit([encoder.finish()]);
       await Promise.all([textureReadback.mapAsync(GPUMapMode.READ), metadata.mapAsync(GPUMapMode.READ), presentReadback.mapAsync(GPUMapMode.READ)]);
@@ -298,7 +305,7 @@ try {
       return Object.fromEntries(entries);
     });
     await writeFile(resolve(artifacts, "shader-compilation.json"), JSON.stringify(compilation, null, 2));
-    assert.ok(Object.keys(compilation).length >= 9);
+    assert.ok(Object.keys(compilation).length >= 11);
     for (const [name, diagnostics] of Object.entries(compilation)) {
       assert.deepEqual(diagnostics.filter((d) => d.type === "error"), [], `${name} WGSL errors`);
     }
@@ -598,6 +605,8 @@ try {
       console.log("  Adapter does not expose timestamp-query; rendering fallback remains healthy.");
     }
   });
+
+  await runViewChecks({ page, check, settled, screenshot, slider, artifacts });
 
   await check("unavailable WebGPU presents the existing error screen", async () => {
     const unsupported = await browser.newPage({ viewport: { width: 640, height: 480 } });

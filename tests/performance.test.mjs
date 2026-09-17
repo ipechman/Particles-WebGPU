@@ -40,6 +40,7 @@ test("FPS uses wall time even below 20fps and ignores invalid intervals", () => 
 
 function postHarness() {
   const e = new Engine({});
+  e.displayMode = "classic";
   e._front = 0; e._fbW = 640; e._fbH = 480;
   e.pipe = Object.fromEntries(["kuwStructure", "kuwBlurH", "kuwAniso", "kuwFilter", "prefilter", "blur", "present"].map(k => [k, k]));
   e.bgKuwStructure = e.bgKuwFilter = e.bgPreFromScene = e.bgPresentScene = [{}, {}];
@@ -92,7 +93,7 @@ test("frame state resets on geometry changes and retains unique counters across 
   e._ensureSizes = e.resize = e._writePostUniforms = e._encodePost = e._encodeFit = e._encodeVoxelize = e._encodeRender = e._dispatch = e._encodeIterate = () => {};
   e._writeUniforms = (_, __, mode) => { e.uniformMode = mode; };
   let view = 0;
-  e._buildRenderUniform = () => new Uint32Array([view]).buffer;
+  e._buildRenderUniform = () => { const u = new ArrayBuffer(224); new Uint32Array(u)[0] = view; return u; };
   const blender = { getTransformCount: () => 3, packMatrices() {} };
   e.frame(blender, {});
   assert.equal(e.frameMode, "compute");

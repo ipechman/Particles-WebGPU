@@ -68,6 +68,28 @@
         </select>
       </label>
 
+      <label class="row" title="View focused spends particles on visible branches in close-ups once the shape settles. Global keeps the original distribution. Overview and unsupported shapes use Global automatically.">
+        <span>Sampling</span>
+        <select id="sampling">
+          <option value="view">View focused</option>
+          <option value="global">Global</option>
+        </select>
+      </label>
+
+      <label class="row" title="Detail adds small-scale depth shading and preserves bright color differences. Classic uses the original final composite.">
+        <span>Display</span>
+        <select id="displayMode">
+          <option value="detail">Detail</option>
+          <option value="classic">Classic</option>
+        </select>
+      </label>
+
+      <label class="row" id="exposureRow" title="Brightness before highlight compression in Detail display.">
+        <span>Exposure</span>
+        <input type="range" id="exposure" min="0.25" max="3" step="0.05" />
+        <span id="exposureVal" class="val"></span>
+      </label>
+
       <label class="row" title="Full uses all particles for lighting. Lower settings reduce lighting work without reducing the rendered particle count; sparse shadows may change.">
         <span>Lighting</span>
         <select id="lighting">

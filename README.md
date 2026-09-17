@@ -34,6 +34,14 @@ Needs a WebGPU-capable browser (recent Chrome / Edge / Chromium).
   fractal is sized inside the lighting box).
 - **Post-processing**: a toggle for the original **Kuwahara filter** (Acerola's
   edge-preserving painterly filter) and a **bloom** slider (0 disables it).
+- **Sampling — View focused** (default) directs particles toward visible fractal
+  branches in close-ups. Pause morphing, zoom and pan toward a structure, and
+  compare with **Global** at the same particle count. The status line shows when
+  focusing is active. Overview and heavily overlapping views retain Global.
+- **Display — Detail** (default) adds small-scale depth shading and compresses
+  bright highlights smoothly. **Exposure** controls its brightness. Bloom now
+  starts at 0.25 instead of 2.2. **Classic** uses the original final composite;
+  select Classic and set Bloom to 2.2 to compare the previous appearance.
 
 ### Reference color palettes
 
@@ -64,8 +72,10 @@ Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
   remain still. **Independent** generates every batch at full depth for comparison.
   Shape changes restart sampling; moving the camera restarts image accumulation.
   Both modes refine toward the existing 67M base-sample target. These are samples,
-  not a guarantee of 67M distinct visible pixels; rendering multiplies the count
-  by the number of transforms.
+  not a guarantee of 67M distinct visible pixels. Global rendering multiplies the
+  count by the number of transforms; focused rendering draws each point once.
+  Focused batches use independent tails in both refinement modes, because advancing
+  a focused world-space point would move it out of its selected branch.
 - **Lighting — Full** (default) retains all particles for voxel occupancy.
   **Balanced** caps lighting samples at about 2M and **Fast** at 524K, without
   lowering the number of rendered particles. Reduced lighting budgets may change
@@ -73,8 +83,41 @@ Run the palette/renderer regression checks with `node --test tests/*.test.mjs`
 - Positions retain float32 precision in packed 12-byte records (25% less storage
   than the previous 16-byte layout). Compute dispatches avoid mostly empty rows,
   batches use disjoint counter ranges, voxel occupancy uses atomic writes, and AO
-  reuses a shared-memory neighborhood tile. Bloom/Kuwahara results are reused
+  reuses a shared-memory neighborhood tile. Detail/Bloom/Kuwahara results are reused
   whenever the displayed image and relevant effect settings are unchanged.
+
+### More detail per particle
+
+The view sampler builds a prefix-free hierarchy of affine IFS branches. It culls
+entire branches against the camera before sampling, then allocates the same N
+particles among visible leaves by projected footprint. A prefix is shared by a
+64-thread workgroup; each thread generates an attractor sample inside that branch.
+The hierarchy is bounded to 8,192 visited nodes, 1,024 leaves, and 24 levels, and
+rebuilds only when the view or geometry changes, after 80 ms without camera motion.
+Dragging redraws the existing cloud; stopping refreshes the focused samples.
+The uploaded table is at most
+80 KiB; the existing 12-byte particle buffer is reused.
+
+The original global batch still establishes the fit and lighting. A single
+64-byte asynchronous readback makes that fit available to the CPU hierarchy;
+camera movement never changes the fit or regenerates global lighting. Stale
+readbacks during morphing are discarded. Maps without a certified contractive
+bound, and views where culling cannot compensate for Global's instanced copies,
+keep the original sampling path. This is a conservative fallback, so some useful
+views may remain Global. Overlapping branch bounds can also spend particles on
+occluded surfaces.
+
+Detail display shades existing pixels using nearby valid depth samples, at the
+displayed scale rather than only the global 128³ lighting scale. Background pixels
+and missing depth samples do not create shading halos. The extra full-resolution
+RGBA16F target uses 8 bytes per pixel; the depth pass is cached at rest.
+
+Focusing changes the finite sample distribution, not the IFS geometry. It benefits
+close-ups, and does not promise a sharper whole-object silhouette at every angle.
+Absolute float32 positions still limit extreme zoom; this change does not implement
+arbitrary-precision fractals or make hidden surfaces visible. At 100M particles the
+normal 67M accumulation target still gives one batch, but view focusing can now
+redistribute that batch when the camera changes.
 
 Open `?profile=1` to enable optional GPU timestamps, sampled every 30 frames.
 `window.__app.engine.profiler.latest` contains timings by pass and their sum.
@@ -104,6 +147,13 @@ The browser suite runs the real app in headed Chromium with software WebGPU
 (Xvfb supplies the display in CI). It checks
 WGSL compilation, GPU errors, nonblank rendering, presets/palettes, accumulation,
 camera controls, resizing, lighting, effects, cache invalidation, and profiling.
+View tests compare the GPU prefix sampler against an independent CPU point oracle,
+check depth shading on synthetic flat/stepped geometry, and render fixed close-ups
+at 32,768 particles against Global and a 32-batch dense reference. Geometry
+comparisons disable bloom and use constant color, so extra occupied pixels cannot
+come from glow. `view-quality.json` records coverage, reference agreement and CPU
+planning time; `detail-quality.json` records highlight clipping. These fixtures
+measure image quality, not 100M-particle hardware FPS.
 Screenshots and a JSON report are written under `test-results/browser/` and
 uploaded by the regression workflow. Software-adapter timings are not hardware
 performance benchmarks. No npm packages are loaded by the deployed site.
@@ -117,7 +167,7 @@ fixtures may differ. The Independent option remains available for comparison.
 
 ## What it does (preserved from the original)
 
-The graphical pipeline mirrors the Unity project one-to-one:
+The graphical pipeline builds on the Unity project:
 
 1. **Generating functions** — the six classic presets (Sierpinski Triangle /
    Vicsek / Sierpinski Carpet, 2D and 3D) plus a procedural random generator,
@@ -138,7 +188,8 @@ The graphical pipeline mirrors the Unity project one-to-one:
    continuously eases the current form toward freshly generated targets. The
    morph function is selectable (Lerp Smoothing, Linear, Smoothstep, Spring).
 
-Post-processing (new): the scene renders to an HDR offscreen target, then an
+Post-processing: the scene renders to an HDR offscreen target, then optional
+depth detail shading, an
 optional **Kuwahara filter** (the original four-quadrant minimum-variance
 filter) and an optional **bloom** pass (bright-pass + separable Gaussian blur,
 controlled by an intensity slider) composite to the screen.
@@ -157,13 +208,16 @@ web/
     blender.js          morphing/smoothing + affine matrix construction
     animcurve.js        AnimationCurve (cubic Hermite + PingPong)
     camera.js           orbit camera
+    view-sampling.js    conservative bounds, visible branch frontier, allocation
     ui.js               control panel wiring
   shaders/
     iterate.wgsl        attractor iteration
+    view-iterate.wgsl   generation inside visible address prefixes
     reduce.wgsl         parallel min/max/sum reduction
     fit.wgsl            auto-fit final transform
     voxelize.wgsl       voxel grid + ambient occlusion
     render.wgsl         instanced point rendering with trilinear AO
+    detail.wgsl         depth detail shading at display resolution
     post.wgsl           Kuwahara filter + bloom prefilter/blur
     present.wgsl        final composite (scene + bloom) to the swap chain
 ```

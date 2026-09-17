@@ -9,6 +9,8 @@ import { MAX_TRANSFORMS } from "./blender.js";
 import { MAX_PALETTE_STOPS } from "./themes.js";
 import { PARTICLE_STRIDE, dispatchShape, lightingSchedule } from "./performance.js";
 import { GPUProfiler } from "./gpu-profiler.js";
+import { attractorBounds, buildViewPlan, multiply64, packViewLeaves,
+  MAX_VIEW_LEAVES, VIEW_LEAF_BYTES } from "./view-sampling.js";
 
 const WG = 64;                 // generic workgroup size
 const REDUCE_PARTIALS = 1024;  // stage-1 workgroups of the bounds reduction
@@ -17,6 +19,8 @@ const RENDER_UNIFORM_SIZE = 128 + MAX_PALETTE_STOPS * 16;
 
 const SHADER_FILES = {
   iterate: "shaders/iterate.wgsl",
+  viewIterate: "shaders/view-iterate.wgsl",
+  detail: "shaders/detail.wgsl",
   reduce: "shaders/reduce.wgsl",
   fit: "shaders/fit.wgsl",
   combine: "shaders/combine.wgsl",
@@ -43,6 +47,13 @@ export class Engine {
     this.sceneRevision = 0;
     this.postStats = { kuwahara: 0, bloom: 0 };
     this._nextBatchSeed = 1;
+    this.samplingMode = "view";
+    this.displayMode = "detail";
+    this.exposure = 1.0;
+    this.detailStrength = 0.65;
+    this._fitRevision = 0;
+    this._viewActive = false;
+    this.viewStats = { active: false, reason: "waiting for shape" };
 
     this.particleColor = [0.93, 0.94, 0.96]; // neutral near-white highlight
     this.occlusionColor = [0.103773594, 0.014195448, 0.014195448];
@@ -63,7 +74,7 @@ export class Engine {
     // should glow, not the whole fractal. Note the prefilter's smoothstep
     // knee spans [threshold, threshold + 0.25] and lit pixels rarely exceed
     // ~0.8, so thresholds much above 0.4 kill the bloom entirely.
-    this.bloomIntensity = 2.2;      // 0 disables bloom
+    this.bloomIntensity = 0.25;     // restrained glow preserves fine contrast
     this.bloomThreshold = 0.4;
     this.bloomSpread = 2.0;
     this.bloomIterations = 3;       // blur passes -> width/softness of the glow
@@ -179,6 +190,15 @@ export class Engine {
           buf(2, C, "uniform"),
         ],
       }),
+      viewIter: d.createBindGroupLayout({ entries: [
+        buf(0, C, "storage"), buf(1, C, "read-only-storage"),
+        buf(2, C, "uniform"), buf(3, C, "read-only-storage"),
+      ] }),
+      detail: d.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+        buf(2, GPUShaderStage.FRAGMENT, "uniform"),
+      ] }),
       reduce: d.createBindGroupLayout({
         entries: [
           buf(0, C, "read-only-storage"),
@@ -247,6 +267,8 @@ export class Engine {
 
     this.pl = {
       iter: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.iter] }),
+      viewIter: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.viewIter] }),
+      detail: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.detail] }),
       reduce: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.reduce] }),
       fit: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.fit] }),
       combine: d.createPipelineLayout({ bindGroupLayouts: [this.bgl.combine] }),
@@ -265,6 +287,7 @@ export class Engine {
 
     this.pipe = {
       iterate: comp("iterate", "iterate", this.pl.iter),
+      iterateView: comp("viewIterate", "iterateView", this.pl.viewIter),
       reducePoints: comp("reduce", "reducePoints", this.pl.reduce),
       reduceBounds: comp("reduce", "reduceBounds", this.pl.reduce),
       fit: comp("fit", "fit", this.pl.fit),
@@ -284,6 +307,13 @@ export class Engine {
       },
       primitive: { topology: "point-list" },
       depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+    });
+
+    this.pipe.detail = d.createRenderPipeline({
+      layout: this.pl.detail,
+      vertex: { module: this.modules.detail, entryPoint: "vsFull" },
+      fragment: { module: this.modules.detail, entryPoint: "fsDetail", targets: [{ format: SCENE_FORMAT }] },
+      primitive: { topology: "triangle-list" },
     });
 
     // Post-processing pipelines (full-screen triangle).
@@ -326,7 +356,9 @@ export class Engine {
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
 
     this.transformsBuf = d.createBuffer({ size: MAX_TRANSFORMS * 64, usage: S, label: "transforms" });
-    this.finalTransformBuf = d.createBuffer({ size: 64, usage: S, label: "finalTransform" });
+    this.finalTransformBuf = d.createBuffer({ size: 64, usage: S | GPUBufferUsage.COPY_SRC, label: "finalTransform" });
+    this.fitReadback = d.createBuffer({ size: 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, label: "fitReadback" });
+    this.viewLeavesBuf = d.createBuffer({ size: MAX_VIEW_LEAVES * VIEW_LEAF_BYTES, usage: S, label: "viewLeaves" });
     this.reduceResultBuf = d.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE, label: "reduceResult" });
     // combined[i] = finalTransform * transforms[i], premultiplied on the GPU
     // after the fit pass (combine.wgsl) so render/voxelize apply one matrix.
@@ -355,6 +387,7 @@ export class Engine {
     this.uBlurH = d.createBuffer({ size: 32, usage: U, label: "uBlurH" });
     this.uBlurV = d.createBuffer({ size: 32, usage: U, label: "uBlurV" });
     this.uPresent = d.createBuffer({ size: 32, usage: U, label: "uPresent" });
+    this.uDetail = d.createBuffer({ size: 32, usage: U, label: "uDetail" });
 
     this.sampler = d.createSampler({
       magFilter: "linear",
@@ -439,6 +472,12 @@ export class Engine {
         { binding: 2, resource: { buffer: this.uChaos } },
       ],
     });
+    this.bgViewIter = d.createBindGroup({ layout: this.bgl.viewIter, entries: [
+      { binding: 0, resource: { buffer: this.positionsBuf } },
+      { binding: 1, resource: { buffer: this.transformsBuf } },
+      { binding: 2, resource: { buffer: this.uChaos } },
+      { binding: 3, resource: { buffer: this.viewLeavesBuf } },
+    ] });
 
     // Stage 1 of the bounds reduction: positions -> per-workgroup partials.
     // Binding 3 is unused by the reducePoints entry, but it must not alias
@@ -531,10 +570,10 @@ export class Engine {
 
     for (const t of this.depthTexs ?? []) t?.destroy();
     for (const t of this.sceneTexs ?? []) t?.destroy();
-    for (const t of [this.kuwaharaTex, this.bloomA, this.bloomB, this.tensorA, this.tensorB]) t?.destroy();
+    for (const t of [this.kuwaharaTex, this.bloomA, this.bloomB, this.tensorA, this.tensorB, this.detailTex]) t?.destroy();
 
     this.depthTexs = [0, 1].map((i) =>
-      d.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT | CP, label: `depth${i}` }));
+      d.createTexture({ size: [w, h], format: "depth24plus", usage: RT | CP, label: `depth${i}` }));
     this.sceneTexs = [0, 1].map((i) =>
       d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT | CP, label: `sceneTex${i}` }));
     this.depthViews = this.depthTexs.map((t) => t.createView());
@@ -542,6 +581,8 @@ export class Engine {
     this._front = 0;
 
     this.kuwaharaTex = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "kuwaharaTex" });
+    this.detailTex = d.createTexture({ size: [w, h], format: SCENE_FORMAT, usage: RT, label: "detailTex" });
+    this.detailView = this.detailTex.createView();
     this.bloomA = d.createTexture({ size: [hw, hh], format: SCENE_FORMAT, usage: RT, label: "bloomA" });
     this.bloomB = d.createTexture({ size: [hw, hh], format: SCENE_FORMAT, usage: RT, label: "bloomB" });
     // Full-res scratch for the anisotropic Kuwahara structure tensor / flow map.
@@ -579,10 +620,16 @@ export class Engine {
     // scene exist per scene buffer (post always reads the front one).
     this.bgPreFromScene = this.sceneViews.map((v) => postBG(v, this.uPre));
     this.bgPreFromKuw = postBG(this.kuwaharaView, this.uPre);
+    this.bgPreFromDetail = postBG(this.detailView, this.uPre);
     this.bgBlurH = postBG(this.bloomAView, this.uBlurH);
     this.bgBlurV = postBG(this.bloomBView, this.uBlurV);
     this.bgPresentScene = this.sceneViews.map((v) => presentBG(v));
     this.bgPresentKuw = presentBG(this.kuwaharaView);
+    this.bgPresentDetail = presentBG(this.detailView);
+    this.bgDetail = this.sceneViews.map((scene, i) => d.createBindGroup({ layout: this.bgl.detail, entries: [
+      { binding: 0, resource: scene }, { binding: 1, resource: this.depthViews[i] },
+      { binding: 2, resource: { buffer: this.uDetail } },
+    ] }));
 
     // Anisotropic Kuwahara passes (binding 1 is unused by the first three).
     const kuwBG = (a, b) =>
@@ -598,6 +645,8 @@ export class Engine {
     this.bgKuwBlurH = kuwBG(this.tensorAView, this.tensorAView);                    // tensorA -> tensorB
     this.bgKuwAniso = kuwBG(this.tensorBView, this.tensorBView);                    // tensorB -> tensorA (flow map)
     this.bgKuwFilter = this.sceneViews.map((v) => kuwBG(v, this.tensorAView));      // scene + flow map -> kuwaharaTex
+    this.bgKuwStructureDetail = kuwBG(this.detailView, this.detailView);
+    this.bgKuwFilterDetail = kuwBG(this.detailView, this.tensorAView);
   }
 
   // ---- the per-frame pipeline --------------------------------------------
@@ -613,12 +662,23 @@ export class Engine {
     blender.packMatrices(this.transformData);
     const recompute = this._computeStale(transformCount) ||
       this._nextBatchSeed >= Math.floor(0x100000000 / this.particlesPerBatch);
+    if (recompute) {
+      this._fitRevision++;
+      this._fitCPU = null;
+      this._viewBounds = undefined;
+      this._viewKey = null;
+      this._viewActive = false;
+      this._viewPlan = null;
+      this.viewStats = { active: false, reason: "waiting for shape" };
+    }
 
     const s = this._schedule(transformCount);
 
     // Classify the frame. The render-state check must run every frame so its
     // cache tracks what is actually on screen.
     const rb = this._buildRenderUniform(s, camera);
+    const resample = this._updateViewPlan(rb, s.count);
+    new Uint32Array(rb, 120, 1)[0] = Number(this._viewActive);
     const renderStale = this._renderStale(rb);
     const accumTarget = this._accumBatchTarget();
     let mode;
@@ -629,8 +689,9 @@ export class Engine {
       this._accumCount = 1;
       this._backBatches = 0;
       this._accumCheckpoint = Math.min(4, accumTarget);
-    } else if (renderStale) {
-      mode = "redraw"; // same cloud, new camera/colors: draw the front from scratch
+    } else if (resample || renderStale) {
+      mode = resample ? "resample" : "redraw";
+      if (resample) this._batchSeed = this._nextBatchSeed++;
       this._accumCount = 1;
       this._backBatches = 0;
       this._accumCheckpoint = Math.min(4, accumTarget);
@@ -666,6 +727,12 @@ export class Engine {
       // changes, so independent refinement never replays the retained batch.
       this._encodeRender(enc, transformCount, true, front);
       this.sceneRevision++;
+    } else if (mode === "resample") {
+      // The fit and global lighting stay camera-independent. Only replace the
+      // samples when the visible address frontier changes.
+      this._encodeIterate(enc);
+      this._encodeRender(enc, transformCount, true, front);
+      this.sceneRevision++;
     } else if (mode === "accumulate") {
       // Accumulation happens off-screen: the front image stays on display
       // untouched while batches bake into the back buffer, and the buffers
@@ -690,9 +757,74 @@ export class Engine {
       }
     }
     this._encodePost(enc);
+    const fitRevision = this._encodeFitReadback(enc);
     this.profiler.finishFrame(enc);
     this.device.queue.submit([enc.finish()]);
     this.profiler.afterSubmit();
+    if (fitRevision !== null) this._readFit(fitRevision);
+  }
+
+  _updateViewPlan(rb, count) {
+    const previous = this._viewActive;
+    if (this.samplingMode !== "view" || !this._fitCPU) {
+      this._viewActive = false;
+      this._viewPending = false;
+      this._viewRequestedKey = null;
+      if (this.samplingMode !== "view") {
+        this._viewKey = null;
+        this.viewStats = { active: false, reason: "global" };
+      }
+      return previous;
+    }
+    const vp = new Float32Array(rb, 0, 16);
+    const key = `${this._fitRevision}:${this.particlesPerBatch}:${this._fbW}:${this._fbH}:${Array.from(vp)}`;
+    if (key === this._viewKey) { this._viewPending = false; return false; }
+    if (key !== this._viewRequestedKey) {
+      this._viewRequestedKey = key;
+      this._viewChangedAt = performance.now();
+    }
+    // Keep camera interaction on the cheap redraw path. Generate a new cloud
+    // after the view has been still briefly, not on every pointer event.
+    this._viewPending = performance.now() - this._viewChangedAt < 80;
+    if (this._viewPending) return false;
+    this._viewKey = key;
+    const start = performance.now();
+    const matrices = Array.from({ length: count }, (_, i) => this.transformData.slice(i * 16, i * 16 + 16));
+    if (this._viewBounds === undefined) {
+      const packedSeeds = this._fixedPoints(count);
+      const seeds = matrices.map((_, i) => packedSeeds.slice(i * 4, i * 4 + 3));
+      this._viewBounds = attractorBounds(matrices, seeds);
+    }
+    const plan = buildViewPlan({ matrices, bounds: this._viewBounds,
+      viewFit: multiply64(vp, this._fitCPU), width: this._fbW, height: this._fbH,
+      particles: this.particlesPerBatch });
+    this._viewPlan = plan;
+    this._viewActive = plan.active;
+    if (plan.active && plan.leaves.length) {
+      this.device.queue.writeBuffer(this.viewLeavesBuf, 0, packViewLeaves(plan.leaves, this.particlesPerBatch));
+    }
+    this.viewStats = { active: plan.active, reason: plan.reason, leaves: plan.leaves.length,
+      visibleMass: plan.visibleMass, visited: plan.visited, planningMs: performance.now() - start };
+    return previous || plan.active;
+  }
+
+  _encodeFitReadback(enc) {
+    if (this.samplingMode !== "view" || this._fitCPU || this._fitPending || !this.fitReadback || this._fitReadbackFailed) return null;
+    this._fitPending = true;
+    enc.copyBufferToBuffer(this.finalTransformBuf, 0, this.fitReadback, 0, 64);
+    return this._fitRevision;
+  }
+
+  _readFit(revision) {
+    // One 64-byte asynchronous readback per stable geometry. Stale morph
+    // results are discarded; no map/readback occurs for camera movement.
+    this.fitReadback.mapAsync(GPUMapMode.READ).then(() => {
+      const fit = new Float32Array(this.fitReadback.getMappedRange()).slice();
+      this.fitReadback.unmap();
+      if (revision === this._fitRevision && fit.every(Number.isFinite)) this._fitCPU = fit;
+    }).catch(() => {
+      this._fitReadbackFailed = true; // Retain the global renderer on failure.
+    }).finally(() => { this._fitPending = false; });
   }
 
   // Accumulation batch budget for the current particle count: enough batches
@@ -746,6 +878,8 @@ export class Engine {
     const gridBounds = 2 * this.voxelBounds * this.scalePadding;
     const aspect = this.canvas.width / Math.max(1, this.canvas.height);
     const vp = camera.viewProj(aspect);
+    const { near, far } = camera.clipPlanes();
+    this._detailCamera = [near, far, 2 * Math.tan(camera.fov / 2) / this.canvas.height];
     const rb = new ArrayBuffer(RENDER_UNIFORM_SIZE);
     new Float32Array(rb, 0, 16).set(vp);
     new Float32Array(rb, 64, 4).set([...this.particleColor, 1]);
@@ -803,16 +937,21 @@ export class Engine {
     }
 
     // uChaos: header + per-transform fixed-point seeds (exact attractor points).
-    const advance = mode === "accumulate" && this.accumulationMode === "reuse";
-    new Uint32Array(this.uChaosCPU, 0, 6).set([
+    const advance = mode === "accumulate" && this.accumulationMode === "reuse" && !this._viewActive;
+    new Uint32Array(this.uChaosCPU, 0, 8).set([
       s.count, this.particlesPerBatch, this._dims(this.particlesPerBatch).width,
       advance ? this.accumulationHops : s.iters, this._batchSeed, Number(advance),
+      this._viewActive ? this._viewPlan.leaves.length : 0, 0,
     ]);
     if (mode === "compute") {
       new Float32Array(this.uChaosCPU, 32).set(this._fixedPoints(s.count));
     }
     q.writeBuffer(this.uChaos, 0, this.uChaosCPU);
     if (mode === "accumulate") return;
+    if (mode === "resample") {
+      q.writeBuffer(this.uRender, 0, rb);
+      return;
+    }
 
     // uCombine: transformCount
     q.writeBuffer(this.uCombine, 0, new Uint32Array([s.count, 0, 0, 0]));
@@ -902,8 +1041,10 @@ export class Engine {
   }
 
   _encodeIterate(enc) {
+    if (this._viewActive && !this._viewPlan.leaves.length) return;
     const d = this._dims(this.particlesPerBatch);
-    this._dispatch(enc, this.pipe.iterate, this.bgIter, [d.x, d.y]);
+    this._dispatch(enc, this._viewActive ? this.pipe.iterateView : this.pipe.iterate,
+      this._viewActive ? this.bgViewIter : this.bgIter, [d.x, d.y]);
   }
 
   _encodeVoxelize(enc) {
@@ -939,7 +1080,8 @@ export class Engine {
     p.setPipeline(this.pipe.render);
     p.setBindGroup(0, this.bgRender);
     // vertexCount = particlesPerBatch, instanceCount = transformCount
-    p.draw(this.particlesPerBatch, transformCount);
+    p.draw(this._viewActive && !this._viewPlan.leaves.length ? 0 : this.particlesPerBatch,
+      this._viewActive ? 1 : transformCount);
     p.end();
   }
 
@@ -971,29 +1113,43 @@ export class Engine {
     q.writeBuffer(this.uPre, 0, new Float32Array([tx, ty, this.bloomThreshold, 0, 0, 0, 0, 0]));
     q.writeBuffer(this.uBlurH, 0, new Float32Array([htx, hty, 0, 0, 1, 0, this.bloomSpread, 0]));
     q.writeBuffer(this.uBlurV, 0, new Float32Array([htx, hty, 0, 0, 0, 1, this.bloomSpread, 0]));
-    q.writeBuffer(this.uPresent, 0, new Float32Array([this.bloomIntensity, 0, 0, 0, 0, 0, 0, 0]));
+    q.writeBuffer(this.uPresent, 0, new Float32Array([
+      this.bloomIntensity, Number(this.displayMode === "detail"), this.exposure, 0, 0, 0, 0, 0,
+    ]));
+    q.writeBuffer(this.uDetail, 0, new Float32Array([
+      ...(this._detailCamera ?? [0.01, 100, 0.002]), this.detailStrength, 0, 0, 0, 0,
+    ]));
   }
 
   _encodePost(enc) {
     // Post always reads the FRONT scene buffer; accumulation renders into the
     // back one, so partially accumulated frames are never visible.
     const f = this._front;
-    const sceneKey = `${this.sceneRevision}:${this._fbW}:${this._fbH}`;
+    let sceneKey = `${this.sceneRevision}:${this._fbW}:${this._fbH}`;
+    const useDetail = this.displayMode === "detail";
+    if (useDetail) {
+      sceneKey += `:detail:${this.detailStrength}`;
+      if (this._cachedDetailKey !== sceneKey) {
+        this._fullscreen(enc, this.pipe.detail, this.bgDetail[f], this.detailView, "detail");
+        this._cachedDetailKey = sceneKey;
+        this.postStats.detail = (this.postStats.detail ?? 0) + 1;
+      }
+    }
 
     // 1) Optional anisotropic Kuwahara filter (4 passes -> kuwaharaTex).
     const useKuwahara = this.kuwaharaEnabled;
     const kuwKey = JSON.stringify([sceneKey, this.kuwaharaKernelSize, this.kuwaharaSharpness,
       this.kuwaharaAlpha, this.kuwaharaZeroCrossing, this.kuwaharaBlurRadius]);
     if (useKuwahara && this._cachedKuwKey !== kuwKey) {
-      this._fullscreen(enc, this.pipe.kuwStructure, this.bgKuwStructure[f], this.tensorAView); // scene -> tensorA
+      this._fullscreen(enc, this.pipe.kuwStructure, useDetail ? this.bgKuwStructureDetail : this.bgKuwStructure[f], this.tensorAView);
       this._fullscreen(enc, this.pipe.kuwBlurH, this.bgKuwBlurH, this.tensorBView);            // tensorA -> tensorB
       this._fullscreen(enc, this.pipe.kuwAniso, this.bgKuwAniso, this.tensorAView);            // tensorB -> tensorA (flow map)
-      this._fullscreen(enc, this.pipe.kuwFilter, this.bgKuwFilter[f], this.kuwaharaView);      // scene + flow map -> kuwaharaTex
+      this._fullscreen(enc, this.pipe.kuwFilter, useDetail ? this.bgKuwFilterDetail : this.bgKuwFilter[f], this.kuwaharaView);
       this._cachedKuwKey = kuwKey;
       this.postStats.kuwahara++;
     }
-    const bgPrefilter = useKuwahara ? this.bgPreFromKuw : this.bgPreFromScene[f];
-    const bgPresent = useKuwahara ? this.bgPresentKuw : this.bgPresentScene[f];
+    const bgPrefilter = useKuwahara ? this.bgPreFromKuw : useDetail ? this.bgPreFromDetail : this.bgPreFromScene[f];
+    const bgPresent = useKuwahara ? this.bgPresentKuw : useDetail ? this.bgPresentDetail : this.bgPresentScene[f];
 
     // 2) Optional bloom: bright-pass, then several separable blur iterations
     //    (each H+V pass widens and softens the glow).
